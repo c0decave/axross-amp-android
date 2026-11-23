@@ -1,0 +1,947 @@
+//! The one screen: a face over the whole display, and over it - shown and
+//! hidden by a tap - the track's title, a seek bar, previous / play / next,
+//! the pickers and the list of faces. A swipe to the side steps through the
+//! faces.
+//!
+//! Everything a finger can hit is at least 48 points (dp) in both
+//! directions, and nothing to hit or read lies under a system bar or a
+//! display cutout (the insets come from the activity).
+//!
+//! The faces are the desktop's, drawn by the desktop's code with the
+//! desktop's flash guard over them ([`viz::draw`]): no setting here turns
+//! the guard off or loosens its limits.
+
+use crate::amp::analyzer::Analyzer;
+use crate::amp::engine::{self, Art};
+use crate::amp::meters::Meters;
+use crate::amp::state::VisualOptions;
+use crate::amp::viz::{self, VizState};
+use crate::gesture::{self, Step};
+use crate::platform::{self, Event};
+use crate::player::Player;
+use eframe::egui;
+use egui::{
+    Align2, Color32, FontId, Id, Pos2, Rect, RichText, Sense, Stroke, Ui, UiBuilder, Vec2, pos2,
+    vec2,
+};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// The least a touch target measures, in points (dp).
+pub const TOUCH: f32 = 48.0;
+/// The transport's buttons are larger: they are hit without looking.
+const BUTTON: f32 = 64.0;
+// (no target smaller than Android's 48 dp: checked when this is compiled)
+const _: () = assert!(TOUCH >= 48.0 && BUTTON >= TOUCH);
+/// Seconds the controls stay after the last touch while music plays.
+const CONTROLS_STAY: f64 = 6.0;
+/// The face shown first.
+const FIRST_FACE: &str = "spectrum";
+/// The loudness meter's target (LUFS), the desktop's default.
+const LOUDNESS_TARGET: f32 = -23.0;
+
+const TEXT: Color32 = Color32::from_rgb(0xec, 0xf0, 0xf1);
+const DIM: Color32 = Color32::from_rgb(0xa9, 0xb4, 0xbc);
+const ACCENT: Color32 = Color32::from_rgb(0x2e, 0xcc, 0x71);
+
+/// How the screen is started.
+pub struct Config {
+    /// The app's own folder for the documents being played (None: the host).
+    pub cache: Option<PathBuf>,
+    /// Tracks to play at once (the desktop preview's command line).
+    pub tracks: Vec<String>,
+}
+
+pub struct Screen {
+    player: Player,
+    meters: Meters,
+    analyzer: Analyzer,
+    viz_state: VizState,
+    options: VisualOptions,
+    tap: Vec<f32>,
+    face: &'static str,
+    scheme: viz::Scheme,
+    cover: Option<egui::TextureHandle>,
+    overview: Option<(String, Arc<Mutex<viz::Overview>>, Arc<AtomicBool>)>,
+    last_frame: Option<f64>,
+    /// The safe insets in pixels: left, top, right, bottom.
+    insets: [i32; 4],
+    controls: bool,
+    faces_open: bool,
+    /// When the screen was touched last (egui's clock).
+    touched: f64,
+    drag_from: Option<Pos2>,
+    /// Where the finger was last seen during the drag.
+    drag_to: Option<Pos2>,
+    /// The seek bar's knob while a finger holds it (0..1).
+    seeking: Option<f32>,
+    picking: bool,
+    /// A line of the screen's own (the picker's answer).
+    note: String,
+    screen_kept_on: bool,
+    frames: u64,
+    /// The activity was shown again: the next frame says so in the log
+    /// (the window's surface was made anew and drawn into).
+    shown_again: bool,
+}
+
+impl Screen {
+    pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Screen {
+        let ctx = cc.egui_ctx.clone();
+        style(&ctx);
+        let wake = {
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        };
+        platform::set_waker(wake.clone());
+        let mut player = Player::start(config.cache, platform::open_fd, false, wake);
+        let transport = player.transport.clone();
+        platform::set_interrupt_hook(move |what| transport.interrupt(what));
+        let meters = Meters::start(player.shared().clone());
+        let mut viz_state = VizState::default();
+        // The pixel faces' shaders run on the GPU where that is cheaper than
+        // a CPU thread's drawing (the desktop's own measurement), small
+        // where the GPU is slow - an emulator's software renderer.
+        if let Some(render_state) = cc.wgpu_render_state.as_ref() {
+            viz::gpu::install(render_state);
+            let choice = viz::gpu::choose(render_state);
+            viz_state.set_gpu(choice.gpu);
+            if choice.gpu {
+                viz_state.gpu.ms_per_pixel = choice.gpu_ms_per_pixel;
+            }
+            let slow = choice.slow_for(choice.gpu);
+            if slow {
+                viz_state.gpu.max_pixels = 90_000.0;
+            }
+            let info = render_state.adapter.get_info();
+            platform::log_line(&format!(
+                "renderer: {:?} on {} ({:?}); shader faces on the {}{}",
+                info.backend,
+                info.name,
+                info.device_type,
+                if choice.gpu { "GPU" } else { "CPU" },
+                if slow { ", small (slow here)" } else { "" },
+            ));
+        } else {
+            platform::log_line("renderer: no wgpu; shader faces on the CPU");
+        }
+        if !config.tracks.is_empty() {
+            let tracks = config
+                .tracks
+                .iter()
+                .map(|path| crate::amp::state::Track {
+                    path: path.clone(),
+                    ..Default::default()
+                })
+                .collect();
+            if platform::request_audio_focus() {
+                player.set_tracks(tracks, true);
+            } else {
+                player.set_tracks(tracks, false);
+            }
+        }
+        Screen {
+            player,
+            meters,
+            analyzer: Analyzer::new(),
+            viz_state,
+            options: VisualOptions::default(),
+            tap: Vec::new(),
+            face: viz::known(FIRST_FACE),
+            scheme: viz::scheme("classic", &BTreeMap::new()),
+            cover: None,
+            overview: None,
+            last_frame: None,
+            insets: [0; 4],
+            controls: true,
+            faces_open: false,
+            touched: 0.0,
+            drag_from: None,
+            drag_to: None,
+            seeking: None,
+            picking: false,
+            note: String::new(),
+            screen_kept_on: false,
+            frames: 0,
+            shown_again: false,
+        }
+    }
+
+    // -- what happens without a frame's picture ------------------------------------------------
+
+    /// The system's and the engine's news. Also called while the activity
+    /// is hidden (eframe's `logic`), when no picture is drawn.
+    fn pump(&mut self, ctx: &egui::Context) {
+        for event in platform::poll() {
+            match event {
+                Event::Insets(insets) => self.insets = insets,
+                Event::Picked(tracks) => {
+                    self.picking = false;
+                    if tracks.is_empty() {
+                        self.note = "Nothing to play was chosen.".into();
+                    } else {
+                        self.note.clear();
+                        let play = platform::request_audio_focus();
+                        self.player.set_picked(tracks, play);
+                        // (the controls stay a moment over the new music)
+                        self.touched = ctx.input(|i| i.time);
+                        self.controls = true;
+                    }
+                }
+                Event::NoPicker => {
+                    self.picking = false;
+                    self.note = "This device has no app to pick documents with.".into();
+                }
+                // (the music was paused by the interrupt hook already)
+                Event::Shown(shown) => self.shown_again = shown && self.frames > 0,
+                Event::Interrupted(_) => {}
+                Event::Media(command) => self.media(command),
+            }
+        }
+        let changed = self.player.pump();
+        if changed.track {
+            self.analyzer.new_track();
+            self.meters.new_track();
+            self.show_art(ctx);
+        }
+        // the screen stays on while music plays under the picture
+        let keep_on = self.player.playing();
+        if keep_on != self.screen_kept_on {
+            self.screen_kept_on = keep_on;
+            platform::keep_screen_on(keep_on);
+        }
+    }
+
+    /// A media command: the lock screen's, a headset's (step 2 sends them).
+    fn media(&mut self, command: i32) {
+        match command {
+            platform::MEDIA_PLAY if !self.player.transport.wants_playing() => self.toggle(),
+            platform::MEDIA_PAUSE | platform::MEDIA_STOP => self.player.pause(),
+            platform::MEDIA_TOGGLE => self.toggle(),
+            platform::MEDIA_NEXT => self.player.next(false),
+            platform::MEDIA_PREVIOUS => self.player.previous(),
+            _ => {}
+        }
+    }
+
+    fn toggle(&mut self) {
+        if self.player.transport.wants_playing() {
+            self.player.pause();
+            platform::abandon_audio_focus();
+        } else if platform::request_audio_focus() {
+            self.player.toggle();
+        } else {
+            self.note = "Another app is using the sound.".into();
+        }
+    }
+
+    /// The track's cover: its texture (the cover face), its small picture
+    /// (the flash guard's estimate of it).
+    fn show_art(&mut self, ctx: &egui::Context) {
+        let art: Option<Arc<Art>> = self.player.info.art.clone();
+        self.cover = art.as_deref().map(|art| {
+            let size = [art.width as usize, art.height as usize];
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, &art.rgba);
+            ctx.load_texture("cover", image, egui::TextureOptions::LINEAR)
+        });
+        self.viz_state.cover_thumb = art.as_deref().map(|art| {
+            Arc::new(viz::Thumb::from_rgba(
+                art.width as usize,
+                art.height as usize,
+                &art.rgba,
+            ))
+        });
+    }
+
+    /// The track's waveform for the overview face, read on a thread of its
+    /// own; another track's reading stops.
+    fn read_overview(&mut self) {
+        let path = self
+            .player
+            .current_path()
+            .filter(|_| self.player.ready() && self.player.duration.is_some())
+            .map(str::to_owned);
+        let Some(path) = path else {
+            if let Some((_, _, stop)) = self.overview.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            return;
+        };
+        if self.overview.as_ref().is_some_and(|(p, _, _)| *p == path) {
+            return;
+        }
+        if let Some((_, _, stop)) = self.overview.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        let shared = Arc::new(Mutex::new(viz::Overview::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (into, flag, file) = (shared.clone(), stop.clone(), path.clone());
+        let _ = std::thread::Builder::new()
+            .name("overview".into())
+            .spawn(move || {
+                let _ = engine::waveform(&file, 1600, &flag, |columns, done| {
+                    if let Ok(mut o) = into.lock() {
+                        o.columns.clear();
+                        o.columns.extend_from_slice(columns);
+                        o.done = done;
+                    }
+                });
+            });
+        self.overview = Some((path, shared, stop));
+    }
+
+    // -- the picture ---------------------------------------------------------------------------
+
+    /// The analysis of this frame's sound, then the face into `rect`: as the
+    /// desktop's window does it.
+    fn draw_face(&mut self, ui: &Ui, rect: Rect) {
+        let (now, stable) = ui.input(|i| (i.time, i.stable_dt));
+        let since = match self.last_frame {
+            Some(last) => (now - last) as f32,
+            None => stable,
+        };
+        let dt = since.clamp(0.0, 0.2);
+        // (the music stopped: the picture falls to rest in the clock's seconds)
+        let fall_dt = since.clamp(0.0, 2.0);
+        self.last_frame = Some(now);
+        let shared = self.player.shared().clone();
+        let written = shared.tap_into(&mut self.tap);
+        let rate = shared.device_rate.load(Ordering::Relaxed);
+        let playing = self.player.playing();
+        // (paused: the picture stands as it was, not emptied)
+        let frozen = !playing && self.player.ready() && self.player.position() > 0.05;
+        self.analyzer.motion = crate::amp::analyzer::guard::Motion::Calm;
+        self.analyzer.calm = viz::scheme_calm(&self.scheme);
+        if !frozen {
+            self.analyzer.set_readings(self.meters.read());
+            self.analyzer.update(
+                &self.tap,
+                written,
+                rate,
+                &self.options,
+                if playing { dt } else { fall_dt },
+                playing,
+                viz::needs_now(self.face, &self.viz_state),
+            );
+        }
+        if self.face == "overview" {
+            self.read_overview();
+        }
+        let overview = self
+            .overview
+            .as_ref()
+            .filter(|_| self.face == "overview")
+            .map(|(_, o, _)| o.clone());
+        let overview = overview.as_ref().and_then(|o| o.lock().ok());
+        let title = self.player.title();
+        let frame = viz::Frame {
+            painter: ui.painter(),
+            rect,
+            a: &self.analyzer,
+            s: &self.scheme,
+            dt: if frozen { 0.0 } else { dt },
+            title: &title,
+            overview: overview.as_deref(),
+            position: self.player.position() as f32,
+            duration: self.player.duration.unwrap_or(0.0) as f32,
+            // (no pointer rests over a touch screen)
+            hover: None,
+            opacity: 1.0,
+            second: false,
+            loudness_target: LOUDNESS_TARGET,
+            cover: self
+                .cover
+                .as_ref()
+                .filter(|_| self.face == "cover")
+                .map(|t| (t.id(), t.size_vec2())),
+        };
+        self.viz_state.gpu.interval = 1.0 / self.options.fps.max(1) as f32;
+        viz::draw(&frame, self.face, &mut self.viz_state);
+    }
+
+    /// The display without what the system covers, in points.
+    fn safe(&self, screen: Rect, pixels_per_point: f32) -> Rect {
+        let [left, top, right, bottom] = self.insets.map(|px| px as f32 / pixels_per_point);
+        safe_rect(screen, [left, top, right, bottom])
+    }
+
+    fn set_face(&mut self, key: &'static str) {
+        self.face = key;
+    }
+
+    // -- the controls --------------------------------------------------------------------------
+
+    fn top_bar(&mut self, ui: &mut Ui, screen: Rect, safe: Rect) {
+        let bar = Rect::from_min_max(safe.min, pos2(safe.max.x, safe.min.y + TOUCH + 16.0));
+        // (the shade reaches up under the status bar)
+        shade(
+            ui,
+            Rect::from_min_max(screen.min, pos2(screen.max.x, bar.max.y)),
+            true,
+        );
+        let row = bar.shrink2(vec2(12.0, 8.0));
+        let width = ((row.width() - 16.0) / 3.0).clamp(72.0, 168.0);
+        let faces = Rect::from_min_size(row.min, vec2(width, TOUCH));
+        let files = Rect::from_min_size(pos2(row.max.x - width, row.min.y), vec2(width, TOUCH));
+        let folder = files.translate(vec2(-(width + 8.0), 0.0));
+        if text_button(ui, faces, "faces", "Faces", self.faces_open).clicked() {
+            self.faces_open = !self.faces_open;
+        }
+        if text_button(ui, folder, "folder", "Folder", false).clicked() && !self.picking {
+            self.picking = true;
+            self.note.clear();
+            platform::pick_folder();
+        }
+        if text_button(ui, files, "files", "Files", false).clicked() && !self.picking {
+            self.picking = true;
+            self.note.clear();
+            platform::pick_files();
+        }
+    }
+
+    fn bottom_panel(&mut self, ui: &mut Ui, screen: Rect, safe: Rect) {
+        let height = 28.0 + 22.0 + TOUCH + BUTTON + 28.0;
+        let panel = Rect::from_min_max(pos2(safe.min.x, safe.max.y - height), safe.max);
+        shade(
+            ui,
+            Rect::from_min_max(pos2(screen.min.x, panel.min.y - 24.0), screen.max),
+            false,
+        );
+        let inner = panel.shrink2(vec2(16.0, 8.0));
+        // the title, and under it the artist and album - or what to say
+        let title = self.player.title();
+        let (first, second) = if !self.player.has_tracks() {
+            (
+                "Pick a folder or files to play".to_owned(),
+                "Swipe for the next picture, tap to hide this.".to_owned(),
+            )
+        } else {
+            (title, self.player.byline())
+        };
+        let second = [&self.note, &self.player.status, &second]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        let line = Rect::from_min_size(inner.min, vec2(inner.width(), 28.0));
+        one_line(ui, line, &first, 19.0, TEXT);
+        let line = line.translate(vec2(0.0, 28.0));
+        let line = Rect::from_min_size(line.min, vec2(inner.width(), 22.0));
+        one_line(ui, line, &second, 14.0, DIM);
+
+        // the seek bar between the time gone and the track's length
+        let row = Rect::from_min_size(pos2(inner.min.x, line.max.y), vec2(inner.width(), TOUCH));
+        let duration = self.player.duration.unwrap_or(0.0).max(0.0);
+        let position = self.player.position().clamp(0.0, duration.max(0.0));
+        let can_seek = self.player.ready() && self.player.info.seekable && duration > 0.0;
+        let shown = match self.seeking {
+            Some(at) => at as f64 * duration,
+            None => position,
+        };
+        let clock = 52.0;
+        let font = FontId::monospace(13.0);
+        ui.painter().text(
+            pos2(row.min.x, row.center().y),
+            Align2::LEFT_CENTER,
+            time_text(shown),
+            font.clone(),
+            DIM,
+        );
+        ui.painter().text(
+            pos2(row.max.x, row.center().y),
+            Align2::RIGHT_CENTER,
+            if duration > 0.0 {
+                time_text(duration)
+            } else {
+                "–:––".to_owned()
+            },
+            font,
+            DIM,
+        );
+        let bar = Rect::from_min_max(
+            pos2(row.min.x + clock, row.min.y),
+            pos2(row.max.x - clock, row.max.y),
+        );
+        let fraction = if duration > 0.0 {
+            (position / duration) as f32
+        } else {
+            0.0
+        };
+        let (now_at, released) = seek_bar(ui, bar, self.seeking.unwrap_or(fraction), can_seek);
+        if can_seek {
+            if let Some(at) = now_at {
+                self.seeking = Some(at);
+            }
+            // (let go: as the bar says, or - a long press that was neither a
+            // tap nor a drag - simply no finger down any more)
+            let let_go = released || !ui.input(|i| i.pointer.any_down());
+            if let_go && let Some(at) = self.seeking.take() {
+                self.player.seek(at as f64 * duration);
+            }
+        } else {
+            self.seeking = None;
+        }
+
+        // previous, play or pause, next
+        let centre = pos2(inner.center().x, row.max.y + 4.0 + BUTTON / 2.0);
+        let gap = BUTTON + 24.0;
+        let enabled = self.player.has_tracks();
+        let square = |x: f32| Rect::from_center_size(pos2(x, centre.y), Vec2::splat(BUTTON));
+        if icon_button(
+            ui,
+            square(centre.x - gap),
+            "previous",
+            Icon::Previous,
+            enabled,
+        )
+        .clicked()
+        {
+            self.player.previous();
+        }
+        let icon = if self.player.transport.wants_playing() {
+            Icon::Pause
+        } else {
+            Icon::Play
+        };
+        if icon_button(ui, square(centre.x), "play", icon, enabled).clicked() {
+            self.toggle();
+        }
+        if icon_button(ui, square(centre.x + gap), "next", Icon::Next, enabled).clicked() {
+            self.player.next(false);
+        }
+    }
+
+    /// The list of faces, group by group; a tap chooses one and closes it.
+    fn face_list(&mut self, ui: &mut Ui, safe: Rect) {
+        let top = safe.min.y + TOUCH + 16.0;
+        let area = Rect::from_min_max(pos2(safe.min.x, top), safe.max).shrink2(vec2(12.0, 8.0));
+        ui.painter()
+            .rect_filled(area, 12.0, Color32::from_rgba_unmultiplied(12, 16, 20, 242));
+        // (a touch on the list is not a touch on the picture under it)
+        ui.interact(
+            area,
+            Id::unique("face-list-ground"),
+            Sense::click_and_drag(),
+        );
+        let mut chosen = None;
+        ui.scope_builder(UiBuilder::new().max_rect(area.shrink(8.0)), |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let width = ui.available_width();
+                    let mut group = None;
+                    for face in viz::FACES.iter().filter(|f| f.group != viz::Group::Off) {
+                        if group != Some(face.group) {
+                            group = Some(face.group);
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(face.group.name()).size(14.0).color(ACCENT));
+                            ui.add_space(2.0);
+                        }
+                        let text = RichText::new(face.name).size(17.0).color(TEXT);
+                        let button = egui::Button::new(text)
+                            .selected(face.key == self.face)
+                            .min_size(vec2(width, TOUCH + 4.0));
+                        if ui.add(button).clicked() {
+                            chosen = Some(face.key);
+                        }
+                    }
+                    ui.add_space(8.0);
+                });
+        });
+        if let Some(key) = chosen {
+            self.set_face(key);
+            self.faces_open = false;
+        }
+    }
+}
+
+impl eframe::App for Screen {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let (screen, now, touching) = ui.input(|i| {
+            (
+                i.viewport_rect(),
+                i.time,
+                i.pointer.any_down() || i.pointer.any_released(),
+            )
+        });
+        if touching {
+            self.touched = now;
+        }
+        let safe = self.safe(screen, ctx.pixels_per_point());
+        // Back: out of the list of faces, else out of the app (to the home
+        // screen; the activity stays as it is)
+        if ui.input(|i| i.key_pressed(egui::Key::BrowserBack) || i.key_pressed(egui::Key::Escape)) {
+            if self.faces_open {
+                self.faces_open = false;
+            } else {
+                platform::leave();
+            }
+        }
+        ui.painter().rect_filled(screen, 0.0, Color32::BLACK);
+
+        // the picture, and a finger on it: a tap shows or hides the
+        // controls, a swipe to the side steps through the faces
+        self.draw_face(ui, screen);
+        let picture = ui.interact(screen, Id::unique("picture"), Sense::click_and_drag());
+        if self.faces_open {
+            if picture.clicked() {
+                self.faces_open = false;
+            }
+        } else {
+            if picture.drag_started() {
+                // (from where the finger went down, not from where egui
+                // first called it a drag)
+                self.drag_from = ui
+                    .input(|i| i.pointer.press_origin())
+                    .or(picture.interact_pointer_pos());
+                self.drag_to = None;
+            }
+            if picture.dragged() {
+                self.drag_to = picture.interact_pointer_pos().or(self.drag_to);
+            }
+            if picture.drag_stopped()
+                && let (Some(from), Some(to)) = (
+                    self.drag_from.take(),
+                    ui.input(|i| i.pointer.interact_pos())
+                        .or(self.drag_to.take()),
+                )
+            {
+                match gesture::swipe(to.x - from.x, to.y - from.y, screen.width()) {
+                    Some(Step::Next) => self.set_face(viz::next(self.face)),
+                    Some(Step::Previous) => self.set_face(viz::previous(self.face)),
+                    None => {}
+                }
+            }
+            if picture.clicked() {
+                self.controls = !self.controls;
+            }
+        }
+
+        // the controls leave by themselves while music plays - never while
+        // there is nothing to play yet, a finger is on them or the list is open
+        if self.controls
+            && self.player.playing()
+            && !self.faces_open
+            && self.seeking.is_none()
+            && now - self.touched > CONTROLS_STAY
+        {
+            self.controls = false;
+        }
+        if self.controls || self.faces_open {
+            self.top_bar(ui, screen, safe);
+        }
+        if self.faces_open {
+            self.face_list(ui, safe);
+        } else if self.controls {
+            self.bottom_panel(ui, screen, safe);
+        }
+
+        self.frames += 1;
+        if self.frames == 1 {
+            // (the line the emulator's smoke test waits for)
+            platform::log_line(&format!(
+                "first frame: {:.0} x {:.0} points at {:.2} pixels a point, face {}",
+                screen.width(),
+                screen.height(),
+                ctx.pixels_per_point(),
+                self.face,
+            ));
+        }
+        if std::mem::take(&mut self.shown_again) {
+            platform::log_line(&format!(
+                "frame after resume: {:.0} x {:.0} points",
+                screen.width(),
+                screen.height(),
+            ));
+        }
+        // the picture moves with the music: frame after frame while it
+        // plays (and while it falls to rest after), else only when touched
+        if self.player.playing() || self.analyzer.bars.iter().any(|b| *b > 0.001) {
+            let fps = self.options.fps.max(1) as f32;
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / fps));
+        }
+    }
+}
+
+/// `screen` without the insets (left, top, right, bottom, in points); never
+/// smaller than nothing, whatever the insets say.
+pub fn safe_rect(screen: Rect, insets: [f32; 4]) -> Rect {
+    let [left, top, right, bottom] = insets.map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 });
+    let left = left.min(screen.width() / 2.0);
+    let right = right.min(screen.width() / 2.0);
+    let top = top.min(screen.height() / 2.0);
+    let bottom = bottom.min(screen.height() / 2.0);
+    Rect::from_min_max(
+        pos2(screen.min.x + left, screen.min.y + top),
+        pos2(screen.max.x - right, screen.max.y - bottom),
+    )
+}
+
+/// m:ss, or h:mm:ss from an hour on.
+pub fn time_text(secs: f64) -> String {
+    let secs = if secs.is_finite() {
+        secs.max(0.0) as u64
+    } else {
+        0
+    };
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Text and touch sizes for a phone; dark, as the picture's ground is.
+fn style(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.all_styles_mut(|style| {
+        style.spacing.interact_size = vec2(TOUCH, TOUCH);
+        style.spacing.button_padding = vec2(16.0, 12.0);
+        style.spacing.item_spacing = vec2(8.0, 6.0);
+        style.spacing.scroll.bar_width = 6.0;
+        style.interaction.selectable_labels = false;
+    });
+}
+
+/// A dark shade behind the controls: the picture stays visible, the text
+/// readable on any face. `down`: darkest at the top (the top bar's).
+fn shade(ui: &Ui, rect: Rect, down: bool) {
+    let dark = Color32::from_rgba_unmultiplied(0, 0, 0, 200);
+    let light = Color32::from_rgba_unmultiplied(0, 0, 0, 110);
+    let (top, bottom) = if down { (dark, light) } else { (light, dark) };
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+    // (a touch on the controls' ground is not a tap on the picture)
+    ui.interact(rect, Id::unique(("shade", down)), Sense::click());
+}
+
+/// One line of text in `rect`, cut short with an ellipsis where it is longer.
+fn one_line(ui: &mut Ui, rect: Rect, text: &str, size: f32, colour: Color32) {
+    if text.is_empty() {
+        return;
+    }
+    ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+        ui.add(egui::Label::new(RichText::new(text).size(size).color(colour)).truncate());
+    });
+}
+
+/// A button with a word on it, at least a touch target high.
+fn text_button(ui: &mut Ui, rect: Rect, id: &str, label: &str, on: bool) -> egui::Response {
+    let response = ui.interact(rect, Id::unique(("button", id)), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    let fill = if response.is_pointer_button_down_on() || on {
+        Color32::from_rgba_unmultiplied(0x2e, 0xcc, 0x71, 70)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+    };
+    // (drawn a little smaller than it can be hit)
+    ui.painter()
+        .rect_filled(rect.shrink2(vec2(0.0, 4.0)), 10.0, fill);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(16.0),
+        TEXT,
+    );
+    response
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Icon {
+    Play,
+    Pause,
+    Previous,
+    Next,
+}
+
+impl Icon {
+    fn label(self) -> &'static str {
+        match self {
+            Icon::Play => "Play",
+            Icon::Pause => "Pause",
+            Icon::Previous => "Previous track",
+            Icon::Next => "Next track",
+        }
+    }
+}
+
+/// A round button with a drawn sign (no font has to carry it).
+fn icon_button(ui: &mut Ui, rect: Rect, id: &str, icon: Icon, enabled: bool) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let response = ui.interact(rect, Id::unique(("button", id)), sense);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, icon.label()));
+    let painter = ui.painter();
+    let centre = rect.center();
+    let main = matches!(icon, Icon::Play | Icon::Pause);
+    let down = response.is_pointer_button_down_on();
+    let fill = match (main, down) {
+        (true, false) => Color32::from_rgba_unmultiplied(0x2e, 0xcc, 0x71, 210),
+        (true, true) => ACCENT,
+        (false, true) => Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+        (false, false) => Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+    };
+    let radius = rect.width().min(rect.height()) / 2.0 - if main { 0.0 } else { 6.0 };
+    painter.circle_filled(centre, radius, fill);
+    let ink = match (enabled, main) {
+        (false, _) => Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+        (true, true) => Color32::from_rgb(0x10, 0x14, 0x18),
+        (true, false) => TEXT,
+    };
+    let triangle = |tip_x: f32, back_x: f32, half: f32| {
+        egui::Shape::convex_polygon(
+            vec![
+                pos2(back_x, centre.y - half),
+                pos2(tip_x, centre.y),
+                pos2(back_x, centre.y + half),
+            ],
+            ink,
+            Stroke::NONE,
+        )
+    };
+    let bar = |x: f32, width: f32, half: f32| {
+        Rect::from_min_max(pos2(x, centre.y - half), pos2(x + width, centre.y + half))
+    };
+    match icon {
+        Icon::Play => {
+            painter.add(triangle(centre.x + 13.0, centre.x - 8.0, 13.0));
+        }
+        Icon::Pause => {
+            painter.rect_filled(bar(centre.x - 10.0, 7.0, 12.0), 1.5, ink);
+            painter.rect_filled(bar(centre.x + 3.0, 7.0, 12.0), 1.5, ink);
+        }
+        Icon::Next => {
+            painter.add(triangle(centre.x + 6.0, centre.x - 9.0, 10.0));
+            painter.rect_filled(bar(centre.x + 6.0, 4.0, 10.0), 1.0, ink);
+        }
+        Icon::Previous => {
+            painter.add(triangle(centre.x - 6.0, centre.x + 9.0, 10.0));
+            painter.rect_filled(bar(centre.x - 10.0, 4.0, 10.0), 1.0, ink);
+        }
+    }
+    response
+}
+
+/// The seek bar: a touch target's height, a thin line with a knob. Gives
+/// where a finger holds the knob now (0..1), and whether it just let go.
+fn seek_bar(ui: &mut Ui, rect: Rect, fraction: f32, enabled: bool) -> (Option<f32>, bool) {
+    let sense = if enabled {
+        Sense::click_and_drag()
+    } else {
+        Sense::hover()
+    };
+    let response = ui.interact(rect, Id::unique("seek"), sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::slider(enabled, fraction as f64, "Position in the track")
+    });
+    let line = Rect::from_min_max(
+        pos2(rect.min.x + 12.0, rect.center().y - 2.0),
+        pos2(rect.max.x - 12.0, rect.center().y + 2.0),
+    );
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let knob = pos2(line.min.x + line.width() * fraction, line.center().y);
+    let painter = ui.painter();
+    painter.rect_filled(
+        line,
+        2.0,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+    );
+    if enabled {
+        painter.rect_filled(
+            Rect::from_min_max(line.min, pos2(knob.x, line.max.y)),
+            2.0,
+            ACCENT,
+        );
+        let radius = if response.is_pointer_button_down_on() {
+            11.0
+        } else {
+            8.0
+        };
+        painter.circle_filled(knob, radius, ACCENT);
+    }
+    let held = (enabled && (response.dragged() || response.is_pointer_button_down_on()))
+        .then(|| response.interact_pointer_pos())
+        .flatten()
+        .map(|p| ((p.x - line.min.x) / line.width().max(1.0)).clamp(0.0, 1.0));
+    // (a tap on the bar seeks there too)
+    let tapped = (enabled && response.clicked())
+        .then(|| response.interact_pointer_pos())
+        .flatten()
+        .map(|p| ((p.x - line.min.x) / line.width().max(1.0)).clamp(0.0, 1.0));
+    let released = enabled && (response.drag_stopped() || response.clicked());
+    (held.or(tapped), released)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_safe_area_is_the_screen_without_the_insets() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 800.0));
+        let safe = safe_rect(screen, [0.0, 32.0, 0.0, 24.0]);
+        assert_eq!(
+            safe,
+            Rect::from_min_max(pos2(0.0, 32.0), pos2(400.0, 776.0))
+        );
+        // (landscape: a cutout on the left, the navigation bar on the right)
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 400.0));
+        let safe = safe_rect(screen, [40.0, 0.0, 48.0, 0.0]);
+        assert_eq!(
+            safe,
+            Rect::from_min_max(pos2(40.0, 0.0), pos2(752.0, 400.0))
+        );
+    }
+
+    #[test]
+    fn insets_that_make_no_sense_leave_a_rectangle() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 800.0));
+        let safe = safe_rect(screen, [-10.0, f32::NAN, 9000.0, f32::INFINITY]);
+        assert!(safe.width() >= 0.0 && safe.height() >= 0.0);
+        assert_eq!(safe.min, pos2(0.0, 0.0));
+        assert_eq!(safe.max.x, 200.0);
+    }
+
+    #[test]
+    fn times_read_as_a_clock() {
+        assert_eq!(time_text(0.0), "0:00");
+        assert_eq!(time_text(59.9), "0:59");
+        assert_eq!(time_text(61.0), "1:01");
+        assert_eq!(time_text(3600.0 + 62.0), "1:01:02");
+        assert_eq!(time_text(f64::NAN), "0:00");
+        assert_eq!(time_text(-5.0), "0:00");
+    }
+
+    #[test]
+    fn every_face_of_the_desktop_can_be_chosen() {
+        // (the list shows them all but "Off"; the first face is one of them)
+        let listed = viz::FACES
+            .iter()
+            .filter(|f| f.group != viz::Group::Off)
+            .count();
+        assert!(listed >= 69, "{listed}");
+        assert_eq!(viz::known(FIRST_FACE), FIRST_FACE);
+    }
+}

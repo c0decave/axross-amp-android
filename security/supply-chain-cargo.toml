@@ -1,0 +1,22 @@
+# axross's supply-chain gate for Cargo (security/supply_chain_cargo.py in
+# github.com/c0decave/axross; the CI checks it out into .axross) on this
+# project's Cargo.lock:
+#   python -I .axross/security/supply_chain_cargo.py --config security/supply-chain-cargo.toml check
+#
+# Every crate needs a reviewed entry in the baseline (one JSON file per
+# crate): a new crate or version fails until it is reviewed.
+#
+# The baseline is the desktop program's, read from the axross-amp submodule -
+# not a copy of it. This project's lock holds no crate the desktop's lock
+# does not (the same versions: it was made from the desktop's lock), so one
+# set of reviews covers both. A crate or a version that only the Android app
+# needs has no entry there: it is reviewed and accepted in axross-amp
+# (security/cargo_baseline/) and the submodule moved to that commit - or, if
+# that stops being practical, this project gets a baseline of its own here.
+lock = "../Cargo.lock"
+own = ["axross-amp-android", "axross-amp"]
+baseline_dir = "../axross-amp/security/cargo_baseline"
+cache_dir = "../target/supply-chain-cache"
+# 14 days, as the desktop program asks (a younger release passes only when
+# its reviewed baseline entry names why it could not wait).
+min_age_days = 14

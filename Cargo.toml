@@ -1,0 +1,52 @@
+[package]
+name = "axross-amp-android"
+version = "0.1.0"
+description = "axross-amp on Android: the player's engine, analysis and visualizations behind a touch screen"
+license = "Apache-2.0"
+repository = "https://github.com/c0decave/axross-amp-android"
+edition = "2024"
+publish = false
+
+# One library, two shapes: the shared object the activity loads
+# (libaxrossamp.so, built by cargo-ndk into the Gradle project's jniLibs) and
+# an rlib for the host's unit tests and the desktop preview.
+[lib]
+name = "axrossamp"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The player itself: the desktop program's library crate, as a git submodule
+# pinned to a commit (see README, "How the desktop crate is pinned").
+axross-amp = { path = "axross-amp" }
+crossbeam-channel = "0.5.17"
+egui = "0.37"
+log = "0.4"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = "0.37.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# (NativeActivity: see docs/ARCHITECTURE.md for why not GameActivity yet)
+android-activity = { version = "0.6.1", features = ["native-activity"] }
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "wgpu", "android-native-activity"] }
+jni = "0.22.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# (the symbols stay in the .so cargo builds: Gradle strips the copy in the
+# APK and keeps them for a crash's stack trace)
+strip = false
+debug = "line-tables-only"
+panic = "abort"
+
+# (the faces draw per pixel and per bar: unoptimised they are far below a
+# frame rate, on an emulator most of all)
+# (line tables only: a debug library with full debug information is some
+# hundred megabytes an ABI before Gradle strips it)
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

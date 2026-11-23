@@ -1,0 +1,195 @@
+# Every push: the supply-chain gate, then the Rust unit tests on the host,
+# the debug APK (arm64-v8a for phones, x86_64 for emulators) and a smoke test
+# of that APK in an emulator. Nothing is built before the gate passes.
+#
+# Third-party actions are pinned by commit, as axross and axross-amp pin
+# them (scripts/check_pins.py fails the gate on one that is not); the Rust
+# toolchain comes from rustup, the Android SDK from the runner's image, the
+# NDK in the version android/gradle.properties names.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  # (the release runs it first: nothing is built for a release before the
+  # gate and the tests pass)
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Before anything is built (a build runs the crates' build scripts and
+  # proc macros): the pins, then axross's supply-chain gate on Cargo.lock -
+  # every crate from crates.io with the checksum it publishes, not yanked,
+  # at least 14 days old, no RustSec / OSV advisory (OSV must answer), no
+  # typo of a popular name, and its .crate the one reviewed in the desktop
+  # program's baseline (axross-amp/security/cargo_baseline/, in the
+  # submodule); then the same with GuardDog's and axross's YARA rules, from
+  # the scanners' hashed lock that axross's PyPI gate checks first.
+  supply-chain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: The pins (actions by commit, the submodule, the lock within the desktop's)
+        run: python3 -I scripts/check_pins.py
+      - name: axross's gate, its scanners' lock and their reviewed baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: c0decave/axross
+          # (pinned by commit: the gate's security/supply_chain_cargo.py as
+          # axross 0.15.180 has it - the commit axross-amp's CI uses)
+          ref: cd0cac8032f6d612af390c344f8b998df086efb9
+          path: .axross
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /security/
+            /build/requirements-scan-tools.txt
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Downloads and crates.io's answers of earlier runs (by checksum; nothing is trusted from it unchecked)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: target/supply-chain-cache
+          key: supply-chain-${{ hashFiles('Cargo.lock') }}
+          restore-keys: supply-chain-
+      - name: Gate (crates.io, RustSec and OSV, age, names, content against the baseline)
+        run: python -I .axross/security/supply_chain_cargo.py --config security/supply-chain-cargo.toml check --require-osv --report supply-chain-report
+      - name: The scanners, checked by axross's PyPI gate, then installed by hash
+        run: |
+          python -I .axross/security/supply_chain_gate.py --config security/scan-tools-gate.toml check --reduced-locks "$RUNNER_TEMP/reduced"
+          python -m venv "$RUNNER_TEMP/scan-venv"
+          "$RUNNER_TEMP/scan-venv/bin/pip" install -q --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/reduced/requirements-scan-tools.txt"
+          python -I .axross/security/supply_chain_gate.py --config security/scan-tools-gate.toml verify-env --python "$RUNNER_TEMP/scan-venv/bin/python" --lock .axross/build/requirements-scan-tools.txt
+      - name: Gate with the scanners (YARA over every member)
+        run: python -I .axross/security/supply_chain_cargo.py --config security/supply-chain-cargo.toml check --require-osv --scan-python "$RUNNER_TEMP/scan-venv/bin/python" --report supply-chain-report
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: supply-chain-report
+          path: supply-chain-report
+          if-no-files-found: ignore
+
+  # The Rust side on the host: formatting, clippy, the unit tests (the
+  # gestures, the pickers' answers, opening documents, the transport's
+  # rules, the player without a sound device). The desktop preview is
+  # compiled with them.
+  test:
+    needs: supply-chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: Rust (rustup, stable, with clippy and rustfmt)
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      - name: Linux libraries (ALSA headers for cpal; CMake builds libopus)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config cmake
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --locked --lib --no-fail-fast
+
+  # The debug APK: libaxrossamp.so for arm64-v8a and x86_64 (cargo-ndk, run
+  # by Gradle), the Java side and the packaging (the Android Gradle Plugin).
+  apk:
+    needs: supply-chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: The toolchain (Rust with the Android targets, cargo-ndk, JDK 17, Gradle, the NDK)
+        uses: ./.github/actions/android-toolchain
+      - name: The Rust side type-checks for Android, without warnings
+        run: cargo ndk --target arm64-v8a --platform 26 clippy --locked --lib -- -D warnings
+      - name: Debug APK (arm64-v8a and x86_64)
+        run: gradle --no-daemon -p android assembleDebug
+      - name: What is in it
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          ls -l "$APK"
+          unzip -l "$APK" | grep -E 'lib/|classes|AndroidManifest'
+          unzip -l "$APK" | grep -q 'lib/arm64-v8a/libaxrossamp.so'
+          unzip -l "$APK" | grep -q 'lib/x86_64/libaxrossamp.so'
+          sha256sum "$APK"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: axross-amp-android-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+      # Gradle's own dependencies (the Android Gradle Plugin and what it
+      # pulls in) are not yet verified by checksum: until
+      # android/gradle/verification-metadata.xml is reviewed and committed,
+      # each run offers the file it would be (docs/ARCHITECTURE.md, "Supply
+      # chain").
+      - name: Gradle's dependency checksums, to review and commit (until they are)
+        if: hashFiles('android/gradle/verification-metadata.xml') == ''
+        run: gradle --no-daemon -p android -PskipCargo --write-verification-metadata sha256 assembleDebug
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: hashFiles('android/gradle/verification-metadata.xml') != ''
+        with:
+          name: gradle-verification-metadata
+          path: android/gradle/verification-metadata.xml
+          if-no-files-found: ignore
+
+  # The APK in an emulator: installed, started, a first frame drawn, alive
+  # through a rotation and a trip to the home screen and back
+  # (scripts/smoke_test.sh). Android 14 must pass; Android 8.0 - the oldest
+  # the app installs on - is told but does not fail the run yet.
+  smoke:
+    needs: apk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - api: 34
+            required: true
+          - api: 26
+            required: false
+    continue-on-error: ${{ !matrix.required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: axross-amp-android-debug-apk
+          path: apk
+      - name: KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Smoke test in the emulator (Android API ${{ matrix.api }}, x86_64)
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: ${{ matrix.api }}
+          arch: x86_64
+          target: default
+          force-avd-creation: true
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: bash scripts/smoke_test.sh apk/app-debug.apk smoke-output
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: smoke-api-${{ matrix.api }}
+          path: smoke-output
+          if-no-files-found: ignore

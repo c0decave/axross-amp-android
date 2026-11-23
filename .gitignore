@@ -1,0 +1,19 @@
+# Cargo
+/target/
+# Gradle and the Android build (the native libraries cargo-ndk writes are
+# under android/app/build/rust/)
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.idea/
+*.iml
+# Signing keys never belong in the repository
+*.jks
+*.keystore
+*.p12
+/android/keystore.properties
+# The supply-chain gate's checkout and its reports (CI)
+/.axross/
+/supply-chain-report/
+/smoke-output/
