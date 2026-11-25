@@ -29,7 +29,8 @@ mkdir -p "$OUT"
 # leaves adb waiting for ever, and the job would end at its own time limit
 # with nothing said.
 ADB_TIMEOUT=${AMP_ADB_TIMEOUT:-60}
-adb() { timeout --kill-after=10 "$ADB_TIMEOUT" command adb "$@"; }
+ADB_BIN=$(command -v adb) || { echo "smoke: no adb on PATH"; exit 1; }
+adb() { timeout --kill-after=10 "$ADB_TIMEOUT" "$ADB_BIN" "$@"; }
 
 say() { printf '%s\n' "smoke: $*"; }
 
@@ -117,7 +118,7 @@ run() {
     return 0
 }
 
-timeout 300 adb wait-for-device || { say "no device"; exit 1; }
+timeout 300 "$ADB_BIN" wait-for-device || { say "no device"; exit 1; }
 say "installing $APK"
 adb install -r "$APK" || { say "the APK could not be installed"; exit 1; }
 
