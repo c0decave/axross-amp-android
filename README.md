@@ -31,9 +31,9 @@ the first builds happen in this repository's CI.
 - **Every format the desktop plays**: MP3, FLAC, Ogg Vorbis, Opus (libopus,
   compiled in), AAC / ALAC in MP4, WAV, AIFF, CAF, MKA - decoded by
   symphonia, played through cpal on AAudio, gapless from track to track.
-- **All 69 faces**, drawn by wgpu on Vulkan (OpenGL ES 3 where there is no
-  Vulkan), the pixel faces by shaders where the GPU does that faster than
-  the CPU.
+- **All 69 faces**, drawn by wgpu on Vulkan (Android 10 and later with a
+  GPU's Vulkan driver) or OpenGL ES 3 (older Android, the emulator), the
+  pixel faces by shaders where the GPU does that faster than the CPU.
 - **Touch**: swipe left / right for the next / previous face; tap to show or
   hide the controls; the controls leave by themselves after a few seconds
   of music. The list of faces opens from "Faces".

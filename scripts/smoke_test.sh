@@ -25,6 +25,12 @@ ALIVE_SECONDS=${AMP_ALIVE_SECONDS:-15}
 
 mkdir -p "$OUT"
 
+# Every adb call has a time limit: an emulator whose GPU translation hangs
+# leaves adb waiting for ever, and the job would end at its own time limit
+# with nothing said.
+ADB_TIMEOUT=${AMP_ADB_TIMEOUT:-60}
+adb() { timeout --kill-after=10 "$ADB_TIMEOUT" command adb "$@"; }
+
 say() { printf '%s\n' "smoke: $*"; }
 
 app_log() { adb logcat -d -s axrossamp:V 2>/dev/null; }
@@ -66,6 +72,7 @@ run() {
         say "the process is gone right after its first frame"
         return 1
     fi
+    app_log | grep -- "backend:" | tail -1
     app_log | grep -- "renderer:" | tail -1
     app_log | grep -- "first frame" | tail -1
     screenshot "$backend-first"
@@ -110,7 +117,7 @@ run() {
     return 0
 }
 
-adb wait-for-device
+timeout 300 adb wait-for-device || { say "no device"; exit 1; }
 say "installing $APK"
 adb install -r "$APK" || { say "the APK could not be installed"; exit 1; }
 

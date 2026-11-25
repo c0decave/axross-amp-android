@@ -21,6 +21,7 @@
 
 pub use axross_amp as amp;
 
+pub mod backend;
 pub mod gesture;
 pub mod opener;
 pub mod picked;
@@ -46,14 +47,13 @@ fn android_main(app: android_activity::AndroidApp) {
         " starting"
     ));
 
-    // Vulkan where the device has it, OpenGL ES otherwise (wgpu tries them
-    // in that order). `adb shell setprop debug.axrossamp.backend gl` (or
-    // `vulkan`) forces one - for a device whose Vulkan driver misbehaves,
-    // and for the emulator in CI.
-    let backends = match platform::android::system_property("debug.axrossamp.backend").as_str() {
-        "gl" | "gles" => wgpu::Backends::GL,
-        "vulkan" => wgpu::Backends::VULKAN,
-        _ => wgpu::Backends::VULKAN | wgpu::Backends::GL,
+    // One backend, chosen before the instance is made (src/backend.rs):
+    // Vulkan on a real GPU from Android 10 on, OpenGL ES elsewhere and on
+    // the emulator. `adb shell setprop debug.axrossamp.backend gl` (or
+    // `vulkan`) forces one.
+    let backends = match choose_backend().backend {
+        backend::Backend::Vulkan => wgpu::Backends::VULKAN,
+        backend::Backend::Gl => wgpu::Backends::GL,
     };
     let mut setup = WgpuSetupCreateNew::without_display_handle();
     setup.instance_descriptor.backends = backends;
@@ -103,4 +103,64 @@ fn android_main(app: android_activity::AndroidApp) {
     // the next start is a fresh process.
     platform::log_line("the activity ended; leaving the process");
     std::process::exit(0);
+}
+
+/// The system's answers and, where needed, Vulkan's adapters (in an
+/// instance of their own, without a surface), for [`backend::System::choose`].
+#[cfg(target_os = "android")]
+fn choose_backend() -> backend::Choice {
+    use eframe::wgpu;
+    use platform::android::system_property;
+
+    let hardware = system_property("ro.hardware");
+    let system = backend::System {
+        forced: system_property("debug.axrossamp.backend"),
+        api_level: system_property("ro.build.version.sdk")
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        emulator: system_property("ro.kernel.qemu") == "1"
+            || system_property("ro.boot.qemu") == "1"
+            || matches!(hardware.as_str(), "ranchu" | "goldfish"),
+    };
+    let vulkan = if system.needs_probe() {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(descriptor);
+        block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
+            .iter()
+            .map(|adapter| {
+                let info = adapter.get_info();
+                backend::VulkanAdapter {
+                    name: info.name,
+                    cpu: info.device_type == wgpu::DeviceType::Cpu,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let choice = system.choose(&vulkan);
+    platform::log_line(&format!(
+        "backend: {:?} ({}; API {}{})",
+        choice.backend,
+        choice.why,
+        system.api_level,
+        if system.emulator { ", emulator" } else { "" },
+    ));
+    choice
+}
+
+/// wgpu's native futures are ready when first polled; this waits for one
+/// without an executor.
+#[cfg(target_os = "android")]
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+        std::thread::yield_now();
+    }
 }

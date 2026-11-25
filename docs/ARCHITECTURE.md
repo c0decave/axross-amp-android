@@ -110,12 +110,22 @@ does everything (it runs `cargo ndk` itself; `-PskipCargo` leaves that out).
 **Java, not Kotlin.** Two small classes. Kotlin would add a Gradle plugin
 and its standard library to the APK and the supply chain for no gain here.
 
-**wgpu: Vulkan, then OpenGL ES.** Both backends are compiled in; wgpu picks
-Vulkan where the device offers it. The device's limits are requested
+**wgpu: Vulkan or OpenGL ES, one of them.** Both backends are compiled in,
+but an instance gets only one (`src/backend.rs`): with both, creating the
+window's surface makes a Vulkan surface as well, which connects to the
+native window first - EGL then cannot (`EGL_BAD_ALLOC`), and the GL adapter
+wgpu falls back to has no surface (seen on the Android 8.0 emulator). The
+choice is made before the instance is: Vulkan on Android 10 or later when
+a Vulkan adapter that is not a software rasterizer is there (looked at in
+an instance of its own, without a surface); OpenGL ES 3 on older Android,
+without a GPU's Vulkan, and on the emulator, whose Vulkan (SwiftShader
+behind the emulator's translation) rejects wgpu's SPIR-V and stalls (seen
+on the Android 14 emulator). The device's limits are requested
 (`downlevel_defaults` at the adapter's resolution), not a desktop's
 defaults - a phone that offers 4096-pixel textures still gets a device.
 `adb shell setprop debug.axrossamp.backend gl|vulkan|auto` forces one; the
-smoke test uses that to fall back on an emulator whose Vulkan does not work.
+smoke test retries with `gl` when the app's own choice gets no first frame
+(and says so as a warning).
 
 **The music pauses when the app is hidden.** See the README. Technically the
 engine could keep playing for a while; it would be killed without warning.

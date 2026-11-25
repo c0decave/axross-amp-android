@@ -39,13 +39,16 @@ settings() {
 
 smoke() {
     local apk=${1:?the APK} out=${2:-smoke-output} rc=0 api
-    api=$(adb shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' || true)
-    bash scripts/smoke_test.sh "$apk" "$out" 2>&1 | tee "$CI_LOGS/smoke.log" || rc=$?
+    api=$(timeout 60 adb shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' || true)
+    # (a watchdog under the job's own limit: what was found is still told)
+    timeout --kill-after=30 1500 bash scripts/smoke_test.sh "$apk" "$out" 2>&1 \
+        | tee "$CI_LOGS/smoke.log" || rc=$?
+    [ "$rc" -ne 124 ] || echo "smoke: FAIL - the smoke test did not end within 25 minutes" | tee -a "$CI_LOGS/smoke.log"
     set +e
     {
-        echo "API $api, $(adb shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
+        echo "API $api, $(timeout 60 adb shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
         grep -E 'smoke: PASS|smoke: FAIL|::warning' "$CI_LOGS/smoke.log" | sed 's/^::warning[^:]*:://'
-        grep -h -E 'starting|renderer:|first frame|frame after resume|panic' "$out/app-log.txt" 2>/dev/null | head -n 20
+        grep -h -E 'starting|backend:|renderer:|first frame|frame after resume|panic' "$out/app-log.txt" 2>/dev/null | head -n 20
     } | annotate "$([ "$rc" -eq 0 ] && echo notice || echo error)" "Smoke test on API $api"
     if [ "$rc" -ne 0 ]; then
         tail -n 70 "$out/app-log.txt" 2>/dev/null | annotate error "The app's own log (API $api)"
