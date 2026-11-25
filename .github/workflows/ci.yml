@@ -5,7 +5,8 @@
 # Third-party actions are pinned by commit, as axross and axross-amp pin
 # them (scripts/check_pins.py fails the gate on one that is not); the Rust
 # toolchain comes from rustup, the Android SDK from the runner's image, the
-# NDK in the version android/gradle.properties names.
+# NDK in the version android/gradle.properties names. What the apk and smoke
+# jobs run lives in scripts/ci/, so that it can change without this file.
 
 name: ci
 
@@ -104,6 +105,8 @@ jobs:
 
   # The debug APK: libaxrossamp.so for arm64-v8a and x86_64 (cargo-ndk, run
   # by Gradle), the Java side and the packaging (the Android Gradle Plugin).
+  # What runs is in scripts/ci/ (android-toolchain.sh, apk.sh): a failing
+  # step leaves its reason as an annotation of the job.
   apk:
     needs: supply-chain
     runs-on: ubuntu-24.04
@@ -115,18 +118,32 @@ jobs:
           submodules: true
       - name: The toolchain (Rust with the Android targets, cargo-ndk, JDK 17, Gradle, the NDK)
         uses: ./.github/actions/android-toolchain
-      - name: The Rust side type-checks for Android, without warnings
-        run: cargo ndk --target arm64-v8a --platform 26 clippy --locked --lib -- -D warnings
-      - name: Debug APK (arm64-v8a and x86_64)
-        run: gradle --no-daemon -p android assembleDebug
-      - name: What is in it
-        run: |
-          APK=android/app/build/outputs/apk/debug/app-debug.apk
-          ls -l "$APK"
-          unzip -l "$APK" | grep -E 'lib/|classes|AndroidManifest'
-          unzip -l "$APK" | grep -q 'lib/arm64-v8a/libaxrossamp.so'
-          unzip -l "$APK" | grep -q 'lib/x86_64/libaxrossamp.so'
-          sha256sum "$APK"
+      # (the crates as downloaded and compiled by earlier runs of this job:
+      # Cargo.lock's checksums are checked again on every build, and only
+      # pushes save it)
+      - name: Earlier builds of the Rust side
+        id: cargo-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: apk-cargo-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            apk-cargo-${{ hashFiles('Cargo.lock') }}-
+            apk-cargo-
+      - name: Debug APK (clippy for Android, Gradle with cargo-ndk, what is in it)
+        run: bash scripts/ci/apk.sh
+      - name: Save the Rust side's build for the next run
+        if: always() && github.event_name == 'push'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: axross-amp-android-debug-apk
@@ -135,13 +152,9 @@ jobs:
       # Gradle's own dependencies (the Android Gradle Plugin and what it
       # pulls in) are not yet verified by checksum: until
       # android/gradle/verification-metadata.xml is reviewed and committed,
-      # each run offers the file it would be (docs/ARCHITECTURE.md, "Supply
-      # chain").
-      - name: Gradle's dependency checksums, to review and commit (until they are)
-        if: hashFiles('android/gradle/verification-metadata.xml') == ''
-        run: gradle --no-daemon -p android -PskipCargo --write-verification-metadata sha256 assembleDebug
+      # apk.sh has Gradle write the file it would be, offered here
+      # (docs/ARCHITECTURE.md, "Supply chain").
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: hashFiles('android/gradle/verification-metadata.xml') != ''
         with:
           name: gradle-verification-metadata
           path: android/gradle/verification-metadata.xml
@@ -177,16 +190,24 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Smoke test in the emulator (Android API ${{ matrix.api }}, x86_64)
+      - name: The emulator for API ${{ matrix.api }} (scripts/ci/emulator.sh)
+        id: emulator
+        run: bash scripts/ci/emulator.sh settings "${{ matrix.api }}"
+      - name: Smoke test in the emulator (Android API ${{ matrix.api }})
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: ${{ matrix.api }}
-          arch: x86_64
-          target: default
+          arch: ${{ steps.emulator.outputs.arch }}
+          target: ${{ steps.emulator.outputs.target }}
+          cores: ${{ steps.emulator.outputs.cores }}
+          ram-size: ${{ steps.emulator.outputs.ram-size }}
+          disk-size: ${{ steps.emulator.outputs.disk-size }}
+          emulator-boot-timeout: ${{ steps.emulator.outputs.boot-timeout }}
+          emulator-build: ${{ steps.emulator.outputs.build }}
+          emulator-options: ${{ steps.emulator.outputs.options }}
           force-avd-creation: true
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
-          script: bash scripts/smoke_test.sh apk/app-debug.apk smoke-output
+          script: bash scripts/ci/emulator.sh smoke apk/app-debug.apk smoke-output
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

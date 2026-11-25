@@ -20,7 +20,8 @@ axross-amp-android/
 │   └── bin/preview.rs          the same screen in a desktop window
 ├── android/                    a plain Gradle project (AGP only)
 │   └── app/src/main/           manifest, two Java classes, resources
-├── scripts/                    smoke_test.sh (emulator), check_pins.py
+├── scripts/                    smoke_test.sh (emulator), check_pins.py,
+│                               ci/: what the CI's apk and smoke jobs run
 ├── security/                   the supply-chain gate's configuration
 └── .github/                    ci.yml, release.yml, the shared toolchain action
 ```

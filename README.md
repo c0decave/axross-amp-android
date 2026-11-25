@@ -199,6 +199,10 @@ uses no other secret (the release itself is made with the run's own token).
    rotation and a trip to the home screen and back. Android 14 must pass;
    Android 8.0 is run and reported.
 
+What the apk and smoke jobs run is in `scripts/ci/` (the tools' versions in
+`scripts/ci/versions.env`, the NDK's in `android/gradle.properties`); a
+failing step leaves its reason as an annotation of the job.
+
 Not covered by the gate yet: Gradle's own dependencies (the Android Gradle
 Plugin and what it pulls from Google's Maven repository) and the tools
 installed in CI (cargo-ndk from crates.io with its own lock, Gradle, the

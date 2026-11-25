@@ -142,4 +142,9 @@ val licenseAssets = tasks.register<Copy>("licenseAssets") {
     into(layout.buildDirectory.dir("licenses/licenses"))
 }
 
-tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(licenseAssets) }
+// (every task that reads the assets' folders depends on it: Gradle refuses a
+// task that reads another's output without saying so)
+tasks.matching {
+    it.name == "preBuild" ||
+        Regex("""merge\w*Assets|\w*[Ll]int\w*""").matches(it.name)
+}.configureEach { dependsOn(licenseAssets) }
