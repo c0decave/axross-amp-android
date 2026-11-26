@@ -27,6 +27,8 @@ fn main() -> eframe::Result {
                 Config {
                     cache: None,
                     tracks,
+                    data: None,
+                    vulkan: false,
                 },
             )))
         }),

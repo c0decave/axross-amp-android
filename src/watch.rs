@@ -9,6 +9,7 @@
 //! File names are only logged by debug builds ([`name`]).
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// A step taking longer than this is logged.
@@ -110,16 +111,32 @@ pub fn start() {
         .name("amp-watch".into())
         .spawn(|| {
             loop {
-                std::thread::sleep(Duration::from_millis(500));
+                let quiet = QUIET.load(Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(if quiet { 10_000 } else { 500 }));
                 check(SLOW);
             }
         });
 }
 
+static NAMES: AtomicBool = AtomicBool::new(cfg!(debug_assertions));
+
+/// Whether file names go to the log (a debug build, the debug APK).
+pub fn set_names(on: bool) {
+    NAMES.store(on, Ordering::Relaxed);
+}
+
+/// Quiet: the app is hidden - the watchdog looks only now and then, and
+/// wakes the device no more than that.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
 /// A file's name for the log: itself in a debug build, only its ending in
 /// a release (no names of the user's files in a phone's log).
 pub fn name(name: &str) -> String {
-    if cfg!(debug_assertions) {
+    if NAMES.load(Ordering::Relaxed) {
         name.to_owned()
     } else {
         match crate::picked::extension(name) {
@@ -161,11 +178,10 @@ mod tests {
 
     #[test]
     fn names_are_kept_out_of_a_release_log() {
-        if cfg!(debug_assertions) {
-            assert_eq!(name("01 One.flac"), "01 One.flac");
-        } else {
-            assert_eq!(name("01 One.flac"), "a .flac file");
-            assert_eq!(name("track"), "a file");
-        }
+        set_names(false);
+        assert_eq!(name("01 One.flac"), "a .flac file");
+        assert_eq!(name("track"), "a file");
+        set_names(true);
+        assert_eq!(name("01 One.flac"), "01 One.flac");
     }
 }

@@ -15,8 +15,12 @@
 //! devices and the drivers grew up. OpenGL ES 3 everywhere else: older
 //! Android versions, a Vulkan that is only a software rasterizer, and the
 //! emulator, whose Vulkan (SwiftShader behind the emulator's translation)
-//! rejects wgpu's shaders and stalls. `adb shell setprop
-//! debug.axrossamp.backend gl|vulkan|auto` overrides the choice.
+//! rejects wgpu's shaders and stalls. Where Vulkan failed before (the
+//! window did not come up, the device was lost) a marker in the app's
+//! files ([`mark_gl`]) makes it OpenGL ES from the next start on. `adb shell
+//! setprop debug.axrossamp.backend gl|vulkan|auto` overrides the choice.
+
+use std::path::Path;
 
 /// The oldest Android version Vulkan is chosen on by itself.
 pub const VULKAN_MIN_API: u32 = 29;
@@ -31,6 +35,8 @@ pub struct System {
     pub api_level: u32,
     /// An emulator (`ro.kernel.qemu`, `ro.boot.qemu`, `ro.hardware`).
     pub emulator: bool,
+    /// Vulkan failed on this device before ([`mark_gl`]).
+    pub gl_marked: bool,
 }
 
 /// One Vulkan adapter, as the probe saw it.
@@ -58,7 +64,10 @@ impl System {
     /// Whether Vulkan's adapters have to be looked at: only for the app's
     /// own choice, and only where Vulkan could be chosen at all.
     pub fn needs_probe(&self) -> bool {
-        self.forced_backend().is_none() && !self.emulator && self.api_level >= VULKAN_MIN_API
+        self.forced_backend().is_none()
+            && !self.emulator
+            && !self.gl_marked
+            && self.api_level >= VULKAN_MIN_API
     }
 
     fn forced_backend(&self) -> Option<Backend> {
@@ -82,6 +91,9 @@ impl System {
         if self.emulator {
             return choice(Backend::Gl, "an emulator: its Vulkan is not a GPU's");
         }
+        if self.gl_marked {
+            return choice(Backend::Gl, "Vulkan failed here before");
+        }
         if self.api_level < VULKAN_MIN_API {
             return choice(Backend::Gl, "Android before 10: OpenGL ES");
         }
@@ -96,6 +108,39 @@ impl System {
     }
 }
 
+/// The marker's name in the app's files.
+pub const MARKER: &str = "gl-instead-of-vulkan";
+
+/// Vulkan failed on this device (`why`): OpenGL ES from the next start on.
+pub fn mark_gl(dir: &Path, why: &str) {
+    match std::fs::write(dir.join(MARKER), why) {
+        Ok(()) => {
+            log::error!(target: "axrossamp", "Vulkan failed ({why}): OpenGL ES from the next start on")
+        }
+        Err(e) => {
+            log::error!(target: "axrossamp", "Vulkan failed ({why}); the marker could not be written: {e}")
+        }
+    }
+}
+
+/// Whether Vulkan failed on this device before.
+pub fn gl_marked(dir: &Path) -> bool {
+    dir.join(MARKER).exists()
+}
+
+/// wgpu's native futures are ready when first polled; this waits for one
+/// without an executor.
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+        std::thread::yield_now();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +150,7 @@ mod tests {
             forced: String::new(),
             api_level,
             emulator: false,
+            gl_marked: false,
         }
     }
 
@@ -148,6 +194,27 @@ mod tests {
         }];
         assert_eq!(system.choose(&software).backend, Backend::Gl);
         assert_eq!(system.choose(&[]).backend, Backend::Gl);
+    }
+
+    #[test]
+    fn where_vulkan_failed_before_it_is_gl_until_forced() {
+        let marked = System {
+            gl_marked: true,
+            ..phone(34)
+        };
+        assert!(!marked.needs_probe());
+        assert_eq!(marked.choose(&gpu()).backend, Backend::Gl);
+        let forced = System {
+            forced: "vulkan".into(),
+            ..marked
+        };
+        assert_eq!(forced.choose(&gpu()).backend, Backend::Vulkan);
+        let dir = std::env::temp_dir().join(format!("axrossamp-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!gl_marked(&dir));
+        mark_gl(&dir, "a test");
+        assert!(gl_marked(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

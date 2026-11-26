@@ -62,11 +62,37 @@ pub struct Config {
     pub cache: Option<PathBuf>,
     /// Tracks to play at once (the desktop preview's command line).
     pub tracks: Vec<String>,
+    /// The app's files (the GL marker, see [`crate::backend::mark_gl`]).
+    pub data: Option<PathBuf>,
+    /// The window draws with Vulkan.
+    pub vulkan: bool,
 }
+
+/// How long the GPU's measurement may take before the faces stay on the
+/// CPU (it waits on the GPU: a driver that stalls must not hold up the
+/// start - Android waits on this thread).
+const GPU_CHECK_TIME: f64 = 8.0;
+
+/// What the GPU's measurement found, on its thread (see [`check_gpu`]).
+struct GpuCheck {
+    choice: viz::gpu::Choice,
+    /// The faces' shaders did not build here.
+    error: Option<String>,
+    took: std::time::Duration,
+}
+
+/// The graphics device was lost (the driver reset it): the faces are drawn
+/// on the CPU from then on, and the next start draws with OpenGL ES.
+static GPU_LOST: AtomicBool = AtomicBool::new(false);
 
 pub struct Screen {
     player: Player,
-    meters: Meters,
+    /// (shared with what rests while the app is hidden: see [`crate::rest`])
+    meters: Arc<Mutex<Option<Meters>>>,
+    rest: Arc<crate::rest::Rest>,
+    /// The GPU's measurement under way: its answer, and when it began.
+    gpu_check: Option<(crossbeam_channel::Receiver<GpuCheck>, f64)>,
+    gpu_lost_told: bool,
     analyzer: Analyzer,
     viz_state: VizState,
     options: VisualOptions,
@@ -121,34 +147,48 @@ impl Screen {
         };
         platform::set_waker(wake.clone());
         let mut player = Player::start(config.cache, platform::open_fd, false, wake);
-        let transport = player.transport.clone();
-        platform::set_interrupt_hook(move |what| transport.interrupt(what));
-        let meters = Meters::start(player.shared().clone());
+        let meters = Arc::new(Mutex::new(Some(Meters::start(player.shared().clone()))));
+        // hidden for a while: the engine ends (its output stream closed),
+        // the meters stop - nothing keeps a hidden app's phone awake
+        let rest = {
+            let transport = player.transport.clone();
+            let meters = meters.clone();
+            crate::rest::Rest::new(crate::rest::REST_AFTER, move || {
+                transport.quit();
+                meters
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+            })
+        };
+        {
+            let transport = player.transport.clone();
+            let rest = rest.clone();
+            platform::set_interrupt_hook(move |what| {
+                transport.interrupt(what);
+                if what == platform::Interrupt::Hidden {
+                    watch::set_quiet(true);
+                    rest.hidden();
+                }
+            });
+        }
         let mut viz_state = VizState::default();
         // The pixel faces' shaders run on the GPU where that is cheaper than
         // a CPU thread's drawing (the desktop's own measurement), small
-        // where the GPU is slow - an emulator's software renderer.
-        if let Some(render_state) = cc.wgpu_render_state.as_ref() {
-            viz::gpu::install(render_state);
-            let choice = viz::gpu::choose(render_state);
-            viz_state.set_gpu(choice.gpu);
-            if choice.gpu {
-                viz_state.gpu.ms_per_pixel = choice.gpu_ms_per_pixel;
-            }
-            let slow = choice.slow_for(choice.gpu);
-            if slow {
-                viz_state.gpu.max_pixels = 90_000.0;
-            }
+        // where the GPU is slow - an emulator's software renderer. The
+        // measurement waits on the GPU, so it runs on a thread of its own:
+        // the faces are on the CPU until it is done.
+        viz_state.set_gpu(false);
+        let gpu_check = cc.wgpu_render_state.as_ref().map(|render_state| {
+            guard_gpu(render_state, config.data.clone(), config.vulkan);
             let info = render_state.adapter.get_info();
             platform::log_line(&format!(
-                "renderer: {:?} on {} ({:?}); shader faces on the {}{}",
-                info.backend,
-                info.name,
-                info.device_type,
-                if choice.gpu { "GPU" } else { "CPU" },
-                if slow { ", small (slow here)" } else { "" },
+                "renderer: {:?} on {} ({:?})",
+                info.backend, info.name, info.device_type
             ));
-        } else {
+            (check_gpu(render_state.clone()), ctx.input(|i| i.time))
+        });
+        if gpu_check.is_none() {
             platform::log_line("renderer: no wgpu; shader faces on the CPU");
         }
         if !config.tracks.is_empty() {
@@ -160,15 +200,15 @@ impl Screen {
                     ..Default::default()
                 })
                 .collect();
-            if platform::request_audio_focus() {
-                player.set_tracks(tracks, true);
-            } else {
-                player.set_tracks(tracks, false);
-            }
+            player.set_tracks(tracks, true);
+            platform::ask_audio_focus();
         }
         Screen {
             player,
             meters,
+            rest,
+            gpu_check,
+            gpu_lost_told: false,
             analyzer: Analyzer::new(),
             viz_state,
             options: VisualOptions::default(),
@@ -228,8 +268,10 @@ impl Screen {
                         };
                     } else if first {
                         self.note.clear();
-                        let play = platform::request_audio_focus();
-                        self.player.set_picked(tracks, play);
+                        // (it plays at once; the focus is asked for on the
+                        // side, and if another app keeps it, it pauses)
+                        self.player.set_picked(tracks, true);
+                        platform::ask_audio_focus();
                         // (the controls stay a moment over the new music)
                         self.touched = ctx.input(|i| i.time);
                         self.controls = true;
@@ -249,7 +291,25 @@ impl Screen {
                     self.note = "This device has no app to pick documents with.".into();
                 }
                 // (the music was paused by the interrupt hook already)
-                Event::Shown(shown) => self.shown_again = shown && self.frames > 0,
+                Event::Shown(shown) => {
+                    self.shown_again = shown && self.frames > 0;
+                    if shown {
+                        watch::set_quiet(false);
+                        // (it rested: a new engine, the track where it was)
+                        if self.rest.shown() {
+                            self.player.new_engine();
+                            *self.meters.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(Meters::start(self.player.shared().clone()));
+                            platform::log_line("shown again: a new engine and meters");
+                        }
+                    }
+                }
+                Event::Focus(granted) => {
+                    if !granted && self.player.transport.wants_playing() {
+                        self.player.pause();
+                        self.note = "Another app is using the sound.".into();
+                    }
+                }
                 Event::Interrupted(_) => {}
                 Event::Media(command) => self.media(command),
             }
@@ -257,7 +317,14 @@ impl Screen {
         let changed = self.player.pump();
         if changed.track {
             self.analyzer.new_track();
-            self.meters.new_track();
+            if let Some(meters) = self
+                .meters
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            {
+                meters.new_track();
+            }
             self.show_art(ctx);
         }
         // the screen stays on while music plays under the picture
@@ -286,10 +353,54 @@ impl Screen {
         if self.player.transport.wants_playing() {
             self.player.pause();
             platform::abandon_audio_focus();
-        } else if platform::request_audio_focus() {
-            self.player.toggle();
         } else {
-            self.note = "Another app is using the sound.".into();
+            self.note.clear();
+            self.player.toggle();
+            platform::ask_audio_focus();
+        }
+    }
+
+    /// The GPU's measurement, once it is done (or given up on), and a lost
+    /// device.
+    fn follow_gpu(&mut self, now: f64) {
+        if GPU_LOST.load(Ordering::Relaxed) && !self.gpu_lost_told {
+            self.gpu_lost_told = true;
+            self.gpu_check = None;
+            self.viz_state.set_gpu(false);
+            self.note = "The graphics driver was reset: please start the app again.".into();
+        }
+        let Some((answer, began)) = &self.gpu_check else {
+            return;
+        };
+        match answer.try_recv() {
+            Ok(check) => {
+                self.gpu_check = None;
+                if let Some(error) = check.error {
+                    log::error!(target: "axrossamp", "the faces' shaders do not build here: {error}; the faces stay on the CPU");
+                    return;
+                }
+                let choice = check.choice;
+                self.viz_state.set_gpu(choice.gpu);
+                if choice.gpu {
+                    self.viz_state.gpu.ms_per_pixel = choice.gpu_ms_per_pixel;
+                }
+                let slow = choice.slow_for(choice.gpu);
+                if slow {
+                    self.viz_state.gpu.max_pixels = 90_000.0;
+                }
+                platform::log_line(&format!(
+                    "shader faces on the {}{} (measured in {} ms)",
+                    if choice.gpu { "GPU" } else { "CPU" },
+                    if slow { ", small (slow here)" } else { "" },
+                    check.took.as_millis()
+                ));
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) if now - *began > GPU_CHECK_TIME => {
+                self.gpu_check = None;
+                log::warn!(target: "axrossamp", "the GPU's measurement takes longer than {GPU_CHECK_TIME} s: the faces stay on the CPU");
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => self.gpu_check = None,
         }
     }
 
@@ -371,7 +482,15 @@ impl Screen {
         self.analyzer.motion = crate::amp::analyzer::guard::Motion::Calm;
         self.analyzer.calm = viz::scheme_calm(&self.scheme);
         if !frozen {
-            self.analyzer.set_readings(self.meters.read());
+            let readings = self
+                .meters
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .map(|m| m.read());
+            if let Some(readings) = readings {
+                self.analyzer.set_readings(readings);
+            }
             self.analyzer.update(
                 &self.tap,
                 written,
@@ -744,6 +863,7 @@ impl eframe::App for Screen {
 impl Screen {
     fn frame(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        self.follow_gpu(ui.input(|i| i.time));
         let (screen, now, touching) = ui.input(|i| {
             (
                 i.viewport_rect(),
@@ -868,6 +988,58 @@ impl Screen {
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / fps));
         }
     }
+}
+
+/// wgpu's errors are logged instead of ending the app (wgpu's own handler
+/// panics at the first one), and a lost device is told: the faces go to
+/// the CPU, and where it was Vulkan the next start draws with OpenGL ES.
+fn guard_gpu(render_state: &eframe::egui_wgpu::RenderState, data: Option<PathBuf>, vulkan: bool) {
+    use std::sync::atomic::AtomicUsize;
+    let told = Arc::new(AtomicUsize::new(0));
+    render_state
+        .device
+        .on_uncaptured_error(Arc::new(move |error: eframe::wgpu::Error| {
+            // (the first few in full; then one now and then)
+            let n = told.fetch_add(1, Ordering::Relaxed);
+            if n < 10 || n.is_power_of_two() {
+                log::error!(target: "axrossamp", "wgpu error ({}): {error}", n + 1);
+            }
+        }));
+    render_state
+        .device
+        .set_device_lost_callback(move |reason, message| {
+            log::error!(target: "axrossamp", "the graphics device was lost ({reason:?}): {message}");
+            GPU_LOST.store(true, Ordering::Relaxed);
+            if vulkan && let Some(dir) = data.as_deref() {
+                crate::backend::mark_gl(dir, &format!("the device was lost: {message}"));
+            }
+        });
+}
+
+/// The faces' GPU resources and the GPU's measurement, on a thread of
+/// their own (both wait on the GPU and its driver), inside an error scope:
+/// shaders this GPU's driver does not take are an answer, not a crash.
+fn check_gpu(
+    render_state: eframe::egui_wgpu::RenderState,
+) -> crossbeam_channel::Receiver<GpuCheck> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let _ = std::thread::Builder::new()
+        .name("amp-gpu".into())
+        .spawn(move || {
+            let began = std::time::Instant::now();
+            let scope = render_state
+                .device
+                .push_error_scope(eframe::wgpu::ErrorFilter::Validation);
+            viz::gpu::install(&render_state);
+            let choice = viz::gpu::choose(&render_state);
+            let error = crate::backend::block_on(scope.pop()).map(|e| e.to_string());
+            let _ = tx.send(GpuCheck {
+                choice,
+                error,
+                took: began.elapsed(),
+            });
+        });
+    rx
 }
 
 /// `screen` without the insets (left, top, right, bottom, in points); never

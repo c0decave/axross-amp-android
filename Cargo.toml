@@ -38,7 +38,20 @@ codegen-units = 1
 # APK and keeps them for a crash's stack trace)
 strip = false
 debug = "line-tables-only"
-panic = "abort"
+# (unwind: a panic on one of the engine's threads - a decoder on an odd
+# file - ends that thread, which the engine handles as "it could not be
+# read", and one at a JNI entry is caught there; with abort any panic
+# anywhere ended the app)
+panic = "unwind"
+
+# The debug APK - the previews testers run - is built with this: the
+# release's settings (no overflow checks, no debug assertions: a preview
+# must not be less stable than a release), quicker to build. The host's
+# tests keep the dev profile, where overflows should be found.
+[profile.preview]
+inherits = "release"
+lto = false
+codegen-units = 16
 
 # (the faces draw per pixel and per bar: unoptimised they are far below a
 # frame rate, on an emulator most of all)

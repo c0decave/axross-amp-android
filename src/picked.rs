@@ -1,5 +1,7 @@
 //! What a picker answered: the documents chosen, as the Java side writes
-//! them (`Bridge.line`) - one line a track, `uri TAB folder TAB name`.
+//! them (`Bridge.line`) - one line a track, `uri TAB folder TAB name TAB
+//! size` (the size the provider gives, -1 for none; older lines end with
+//! the name).
 
 use std::cmp::Ordering;
 
@@ -11,23 +13,30 @@ pub struct Picked {
     pub uri: String,
     pub folder: String,
     pub name: String,
+    /// What the provider says the document holds (None: it does not say).
+    pub size: Option<u64>,
 }
 
 /// The lines of a picker's answer; a line without a URI is none.
 pub fn parse(text: &str) -> Vec<Picked> {
     text.lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
+            let mut parts = line.splitn(4, '\t');
             let uri = parts.next()?.trim();
             if uri.is_empty() {
                 return None;
             }
             let folder = parts.next().unwrap_or("").trim();
             let name = parts.next().unwrap_or("").trim();
+            let size = parts
+                .next()
+                .and_then(|size| size.trim().parse::<i64>().ok())
+                .and_then(|size| u64::try_from(size).ok());
             Some(Picked {
                 uri: uri.to_owned(),
                 folder: folder.to_owned(),
                 name: name.to_owned(),
+                size,
             })
         })
         .collect()
@@ -85,11 +94,14 @@ mod tests {
     }
 
     #[test]
-    fn a_name_may_hold_what_is_left_of_the_line() {
-        // (the Java side takes tabs out of names; one that slipped through
-        // stays in the name)
-        let got = parse("u\tf\ta\tb");
-        assert_eq!(got[0].name, "a\tb");
+    fn a_line_may_carry_the_providers_size() {
+        let got = parse("u\tf\ta.mp3\t12345\nv\t\tb.mp3\t-1\nw\t\tc.mp3\tnone\n");
+        assert_eq!(got[0].name, "a.mp3");
+        assert_eq!(got[0].size, Some(12345));
+        assert_eq!(got[1].size, None);
+        assert_eq!(got[2].size, None);
+        // (a line without one: none)
+        assert_eq!(parse("u\tf\ta.mp3")[0].size, None);
     }
 
     #[test]

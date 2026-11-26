@@ -100,6 +100,8 @@ pub enum Event {
     Interrupted(Interrupt),
     /// A media command (step 2).
     Media(i32),
+    /// The answer to [`ask_audio_focus`]: whether the music may play.
+    Focus(bool),
 }
 
 type Waker = Box<dyn Fn() + Send>;
@@ -181,14 +183,13 @@ pub fn dispatch(kind: i32, a: i32, b: i32, c: i32, d: i32, text: &str) {
         EVENT_MEDIA => (Event::Media(a), None),
         _ => return,
     };
-    let mut hub = hub();
-    if let (Some(what), Some(hook)) = (interrupt, hub.interrupt.as_ref()) {
-        hook(what);
+    {
+        let hub = hub();
+        if let (Some(what), Some(hook)) = (interrupt, hub.interrupt.as_ref()) {
+            hook(what);
+        }
     }
-    hub.events.push(event);
-    if let Some(wake) = hub.waker.as_ref() {
-        wake();
-    }
+    push(event);
 }
 
 /// The system's folder picker; the answer comes as [`Event::Picked`].
@@ -208,14 +209,51 @@ pub fn open_fd(uri: &str) -> Option<i32> {
     (fd >= 0).then_some(fd)
 }
 
-/// Asks for the audio focus before the music starts; false: another app
-/// holds it and does not give it up (a call).
-pub fn request_audio_focus() -> bool {
-    imp::call(CALL_REQUEST_FOCUS, "") != 0
+/// The queued event, and a frame to read it.
+fn push(event: Event) {
+    let mut hub = hub();
+    hub.events.push(event);
+    if let Some(wake) = hub.waker.as_ref() {
+        wake();
+    }
 }
 
+/// Audio focus is asked for and given up on a thread of its own: the calls
+/// go to the system (binder), and the window's thread - which Android's
+/// lifecycle and input wait on - waits for nobody.
+fn focus_worker() -> &'static crossbeam_channel::Sender<bool> {
+    static WORKER: std::sync::OnceLock<crossbeam_channel::Sender<bool>> =
+        std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::unbounded::<bool>();
+        let _ = std::thread::Builder::new()
+            .name("amp-focus".into())
+            .spawn(move || {
+                for ask in rx {
+                    if ask {
+                        // (1: granted; 0 refused; -1: the call failed - not
+                        // granted either)
+                        let granted = imp::call(CALL_REQUEST_FOCUS, "") == 1;
+                        push(Event::Focus(granted));
+                    } else {
+                        imp::call(CALL_ABANDON_FOCUS, "");
+                    }
+                }
+            });
+        tx
+    })
+}
+
+/// Asks for the audio focus (the music is about to play): the answer comes
+/// as [`Event::Focus`] - false: another app holds it and does not give it
+/// up (a call).
+pub fn ask_audio_focus() {
+    let _ = focus_worker().send(true);
+}
+
+/// Gives the audio focus up (the music paused by the user).
 pub fn abandon_audio_focus() {
-    imp::call(CALL_ABANDON_FOCUS, "");
+    let _ = focus_worker().send(false);
 }
 
 /// Back at the top of the app: to the home screen (the activity is kept).

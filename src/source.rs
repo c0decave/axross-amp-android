@@ -24,12 +24,22 @@ pub enum Request {
     Load {
         uri: String,
         name: String,
+        /// What the provider says the document holds (None: unknown).
+        size: Option<u64>,
         start_ms: u64,
         play: bool,
         generation: u64,
     },
     /// Open the track that follows and name it to the engine (None: none).
-    Queue(Option<(String, String, u64)>),
+    Queue(Option<Queue>),
+}
+
+/// The track to follow.
+pub struct Queue {
+    pub uri: String,
+    pub name: String,
+    pub size: Option<u64>,
+    pub generation: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -59,6 +69,7 @@ struct Job {
     kind: Kind,
     uri: String,
     name: String,
+    size: Option<u64>,
     generation: u64,
 }
 
@@ -91,6 +102,7 @@ impl Asked {
             Request::Load {
                 uri,
                 name,
+                size,
                 start_ms,
                 play,
                 generation,
@@ -99,16 +111,18 @@ impl Asked {
                     kind: Kind::Load { start_ms, play },
                     uri,
                     name,
+                    size,
                     generation,
                 });
                 self.queue = None;
             }
             Request::Queue(queue) => {
-                self.queue = Some(queue.map(|(uri, name, generation)| Job {
+                self.queue = Some(queue.map(|q| Job {
                     kind: Kind::Queue,
-                    uri,
-                    name,
-                    generation,
+                    uri: q.uri,
+                    name: q.name,
+                    size: q.size,
+                    generation: q.generation,
                 }));
             }
         }
@@ -120,6 +134,10 @@ struct Worker {
     transport: Arc<Transport>,
     replies: Sender<Reply>,
     wake: Box<dyn Fn() + Send>,
+    /// The documents the engine has now: the track loaded last, the one
+    /// queued behind it (the opener lets go of neither).
+    playing: Option<String>,
+    queued: Option<String>,
 }
 
 impl Worker {
@@ -136,6 +154,11 @@ impl Worker {
             )),
         }
         let generation = job.generation;
+        match &opened {
+            Ok(_) if matches!(job.kind, Kind::Load { .. }) => self.playing = Some(job.uri.clone()),
+            Ok(_) => self.queued = Some(job.uri.clone()),
+            Err(_) => {}
+        }
         match (job.kind, opened) {
             (Kind::Load { start_ms, play }, Ok(path)) => {
                 self.transport
@@ -167,7 +190,7 @@ impl Worker {
     fn begin(&mut self, job: Job) -> Option<(Job, Opening)> {
         watch::doing(THREAD, job.what());
         let since = Instant::now();
-        match self.opener.begin(&job.uri, &job.name) {
+        match self.opener.begin(&job.uri, &job.name, job.size) {
             Begun::Ready(path) => {
                 self.finish(job, Ok(path), since);
                 None
@@ -241,8 +264,11 @@ impl Worker {
                 && let Some((job, opening)) = current.take()
             {
                 let since = opening.started;
-                let opened = result
-                    .map(|(path, file): (PathBuf, _)| self.opener.finish(&job.uri, path, file));
+                let in_use: Vec<&str> = [self.playing.as_deref(), self.queued.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let opened = result.map(|placed| self.opener.finish(&job.uri, placed, &in_use));
                 opening.abandon();
                 self.finish(job, opened, since);
             }
@@ -267,6 +293,8 @@ impl Source {
             transport,
             replies: replies_tx,
             wake: Box::new(wake),
+            playing: None,
+            queued: None,
         };
         let _ = std::thread::Builder::new()
             .name(THREAD.into())

@@ -20,16 +20,18 @@
         android:label="@string/app_name"
         android:theme="@style/AmpTheme">
 
-        <!-- configChanges: a rotation or a resize reaches the Rust side as a
-             new surface size; the activity (and android_main) are not
-             started again for it.
+        <!-- configChanges: every change Android 16 knows - a rotation, a
+             resize, bold text, a new locale reach the Rust side as a new
+             surface size or nothing at all; the activity (and android_main)
+             are not started again for any of them (one android_main a
+             process: MainActivity.onDestroy ends the process).
              enableOnBackInvokedCallback false: Back arrives as a key on
              every Android version (the Rust side closes the list of faces
              with it, or leaves for the home screen). -->
         <activity
             android:name=".MainActivity"
             android:enableOnBackInvokedCallback="false"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|fontScale|uiMode|layoutDirection|locale"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|fontScale|fontWeightAdjustment|grammaticalGender|uiMode|layoutDirection|locale|colorMode|touchscreen|mcc|mnc"
             android:exported="true"
             android:launchMode="singleTask"
             android:resizeableActivity="true">

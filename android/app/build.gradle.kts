@@ -67,6 +67,8 @@ android {
             // (two small Java classes: nothing to shrink, and no R8 rules to
             // keep the JNI names by)
             isMinifyEnabled = false
+            // (the JNI names, kept should minify ever be turned on)
+            proguardFiles("proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release")
         }
     }
@@ -113,7 +115,9 @@ fun cargoNdk(name: String, release: Boolean) = tasks.register<Exec>(name) {
     abis.forEach { command += listOf("--target", it) }
     command += listOf("--platform", "26", "--output-dir", out.get().asFile.absolutePath)
     command += listOf("build", "--locked", "--lib")
-    if (release) command += "--release"
+    // (the debug APK: Cargo.toml's preview profile - a release's checks, not
+    // the dev profile's overflow checks and debug assertions)
+    command += if (release) listOf("--release") else listOf("--profile", "preview")
     commandLine(command)
     doFirst {
         check(!System.getenv("ANDROID_NDK_HOME").isNullOrEmpty()) {

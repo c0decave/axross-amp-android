@@ -20,8 +20,9 @@ settings() {
     local api=${1:?the API level}
     local arch=x86_64 target=default cores=3 ram=3072M disk=6000M timeout=900 build=""
     # SwiftShader: the emulator's GPU in software, OpenGL ES 3 and Vulkan
-    # (where the image offers it), the same on every runner.
-    local options="-no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -camera-front none"
+    # (where the image offers it), the same on every runner. With its sound
+    # device (no -noaudio): the smoke test plays music.
+    local options="-no-window -gpu swiftshader_indirect -no-boot-anim -no-snapshot -camera-back none -camera-front none"
     case "$api" in
         26) ram=2048M ;;
     esac

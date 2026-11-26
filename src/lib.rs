@@ -27,6 +27,7 @@ pub mod opener;
 pub mod picked;
 pub mod platform;
 pub mod player;
+pub mod rest;
 pub mod screen;
 pub mod source;
 pub mod transport;
@@ -45,6 +46,9 @@ fn android_main(app: android_activity::AndroidApp) {
 
     platform::android::init_logging();
     platform::android::init(&app);
+    // (file names in the log: a debug build's, the debug APK's - which is
+    // built with the release's settings, see Cargo.toml's preview profile)
+    watch::set_names(cfg!(debug_assertions) || platform::android::package().ends_with(".debug"));
     watch::start();
     platform::log_line(concat!(
         "axross-amp-android ",
@@ -53,12 +57,16 @@ fn android_main(app: android_activity::AndroidApp) {
     ));
 
     // One backend, chosen before the instance is made (src/backend.rs):
-    // Vulkan on a real GPU from Android 10 on, OpenGL ES elsewhere and on
-    // the emulator. `adb shell setprop debug.axrossamp.backend gl` (or
-    // `vulkan`) forces one.
-    let backends = match choose_backend().backend {
-        backend::Backend::Vulkan => wgpu::Backends::VULKAN,
-        backend::Backend::Gl => wgpu::Backends::GL,
+    // Vulkan on a real GPU from Android 10 on, OpenGL ES elsewhere, on the
+    // emulator and where Vulkan failed before. `adb shell setprop
+    // debug.axrossamp.backend gl` (or `vulkan`) forces one.
+    let data = app.internal_data_path();
+    let choice = choose_backend(data.as_deref().is_some_and(backend::gl_marked));
+    let vulkan = choice.backend == backend::Backend::Vulkan;
+    let backends = if vulkan {
+        wgpu::Backends::VULKAN
+    } else {
+        wgpu::Backends::GL
     };
     let mut setup = WgpuSetupCreateNew::without_display_handle();
     setup.instance_descriptor.backends = backends;
@@ -85,22 +93,38 @@ fn android_main(app: android_activity::AndroidApp) {
     };
     options.wgpu_options.wgpu_setup = WgpuSetup::CreateNew(setup);
 
-    let cache = app.internal_data_path().map(|dir| dir.join("open"));
-    let result = eframe::run_native(
-        "axross-amp",
-        options,
-        Box::new(move |cc| {
-            Ok(Box::new(screen::Screen::new(
-                cc,
-                screen::Config {
-                    cache,
-                    tracks: Vec::new(),
-                },
-            )))
-        }),
-    );
-    if let Err(e) = result {
-        log::error!(target: "axrossamp", "the window ended with an error: {e}");
+    // (documents being played get their names in the cache: what is copied
+    // there - a provider that cannot open in place - the system may
+    // reclaim when storage runs short)
+    let cache = data
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(|app_dir| app_dir.join("cache").join("open"));
+    let config = screen::Config {
+        cache,
+        tracks: Vec::new(),
+        data: data.clone(),
+        vulkan,
+    };
+    // (a panic on this thread - with unwinding, see Cargo.toml - ends the
+    // window, and the process below: never music playing on without one)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native(
+            "axross-amp",
+            options,
+            Box::new(move |cc| Ok(Box::new(screen::Screen::new(cc, config)))),
+        )
+    }));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            log::error!(target: "axrossamp", "the window ended with an error: {e}");
+            // (Vulkan that does not come up here: OpenGL ES next time)
+            if vulkan && let Some(dir) = data.as_deref() {
+                backend::mark_gl(dir, &format!("the window ended with an error: {e}"));
+            }
+        }
+        Err(_) => log::error!(target: "axrossamp", "the window's thread panicked"),
     }
     // The activity is gone (Back, or the system closed it). winit cannot
     // build a second event loop in one process, and a start of the activity
@@ -112,8 +136,9 @@ fn android_main(app: android_activity::AndroidApp) {
 
 /// The system's answers and, where needed, Vulkan's adapters (in an
 /// instance of their own, without a surface), for [`backend::System::choose`].
+/// `gl_marked`: Vulkan failed on this device before.
 #[cfg(target_os = "android")]
-fn choose_backend() -> backend::Choice {
+fn choose_backend(gl_marked: bool) -> backend::Choice {
     use eframe::wgpu;
     use platform::android::system_property;
 
@@ -127,12 +152,13 @@ fn choose_backend() -> backend::Choice {
         emulator: system_property("ro.kernel.qemu") == "1"
             || system_property("ro.boot.qemu") == "1"
             || matches!(hardware.as_str(), "ranchu" | "goldfish"),
+        gl_marked,
     };
     let vulkan = if system.needs_probe() {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN;
         let instance = wgpu::Instance::new(descriptor);
-        block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
+        backend::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
             .iter()
             .map(|adapter| {
                 let info = adapter.get_info();
@@ -154,18 +180,4 @@ fn choose_backend() -> backend::Choice {
         if system.emulator { ", emulator" } else { "" },
     ));
     choice
-}
-
-/// wgpu's native futures are ready when first polled; this waits for one
-/// without an executor.
-#[cfg(target_os = "android")]
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-    loop {
-        if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-        std::thread::yield_now();
-    }
 }

@@ -159,3 +159,15 @@ pub fn system_property(name: &str) -> String {
     let length = (length.max(0) as usize).min(value.len());
     String::from_utf8_lossy(&value[..length]).into_owned()
 }
+
+/// This process's name: the package's (`io.github.c0decave.axrossamp`, the
+/// debug APK's with `.debug`); "" when it cannot be read.
+pub fn package() -> String {
+    std::fs::read("/proc/self/cmdline")
+        .ok()
+        .and_then(|bytes| {
+            let first = bytes.split(|b| *b == 0).next()?.to_vec();
+            String::from_utf8(first).ok()
+        })
+        .unwrap_or_default()
+}

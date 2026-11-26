@@ -3,6 +3,8 @@ package io.github.c0decave.axrossamp;
 import android.app.NativeActivity;
 import android.content.Intent;
 import android.os.Bundle;
+import android.os.Process;
+import android.util.Log;
 
 /**
  * The one activity: a NativeActivity whose window the Rust side draws into
@@ -28,7 +30,14 @@ public final class MainActivity extends NativeActivity {
         bridge.edgeToEdge();
         super.onCreate(savedInstanceState);
         bridge.watchInsets();
-        bridge.startWatchdog();
+        bridge.testTracks(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        bridge.testTracks(intent);
     }
 
     /** Called from Rust (any thread): see Bridge.call. */
@@ -47,20 +56,34 @@ public final class MainActivity extends NativeActivity {
     @Override
     protected void onStart() {
         super.onStart();
+        bridge.startWatchdog();
         Bridge.event(Bridge.EVENT_LIFECYCLE, 1, 0, 0, 0, null);
     }
 
     @Override
     protected void onStop() {
-        // (no foreground service yet: the music does not go on unseen)
+        // (no foreground service yet: the music does not go on unseen; the
+        // watchdog does not wake a hidden app)
         Bridge.event(Bridge.EVENT_LIFECYCLE, 0, 0, 0, 0, null);
+        bridge.stopWatchdog();
         super.onStop();
     }
 
+    /**
+     * The activity is gone for good (the task swiped away, a configuration
+     * change the manifest does not list, "Don't keep activities"): so is the
+     * process. android_main cannot run twice in one process (winit makes one
+     * event loop a process), and the NativeActivity glue would wait here for
+     * an android_main that never returns (winit 0.30 ignores Destroy) - the
+     * main thread blocked for good, an ANR. The next start is a fresh
+     * process.
+     */
     @Override
     protected void onDestroy() {
         bridge.stopWatchdog();
         bridge.release();
+        Log.i("axrossamp", "the activity is destroyed: the process ends");
+        Process.killProcess(Process.myPid());
         super.onDestroy();
     }
 }

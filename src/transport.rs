@@ -11,6 +11,7 @@ use crate::amp::engine::{Command, Queued};
 use crate::platform::Interrupt;
 use crossbeam_channel::Sender;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Wanted {
     /// The music should be playing.
@@ -21,19 +22,56 @@ struct Wanted {
 }
 
 pub struct Transport {
-    tx: Sender<Command>,
+    /// The engine's commands (another engine's after a rest: see
+    /// [`Transport::set_engine`]).
+    tx: Mutex<Sender<Command>>,
     wanted: Mutex<Wanted>,
+    /// Counts the pauses - the user's, the system's, a stop: what was
+    /// planned to play later plays only if none came between.
+    pauses: AtomicU64,
 }
 
 impl Transport {
     pub fn new(tx: Sender<Command>) -> Transport {
         Transport {
-            tx,
+            tx: Mutex::new(tx),
             wanted: Mutex::new(Wanted {
                 playing: false,
                 resume: false,
             }),
+            pauses: AtomicU64::new(0),
         }
+    }
+
+    fn send(&self, command: Command) {
+        let tx = self
+            .tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = tx.send(command);
+    }
+
+    /// The engine's commands go to `tx` from now on (a new engine).
+    pub fn set_engine(&self, tx: Sender<Command>) {
+        *self
+            .tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = tx;
+    }
+
+    /// The engine ends (the app rests while hidden: its output stream is
+    /// closed); a new one comes with [`Transport::set_engine`].
+    pub fn quit(&self) {
+        self.send(Command::Quit);
+    }
+
+    /// The pauses so far (see the field).
+    pub fn pauses(&self) -> u64 {
+        self.pauses.load(Ordering::Relaxed)
+    }
+
+    fn paused(&self) {
+        self.pauses.fetch_add(1, Ordering::Relaxed);
     }
 
     fn wanted(&self) -> std::sync::MutexGuard<'_, Wanted> {
@@ -52,7 +90,7 @@ impl Transport {
         let mut wanted = self.wanted();
         wanted.playing = true;
         wanted.resume = false;
-        let _ = self.tx.send(Command::Play);
+        self.send(Command::Play);
     }
 
     /// The user's pause.
@@ -60,7 +98,8 @@ impl Transport {
         let mut wanted = self.wanted();
         wanted.playing = false;
         wanted.resume = false;
-        let _ = self.tx.send(Command::Pause);
+        self.paused();
+        self.send(Command::Pause);
     }
 
     /// A track is about to be opened to play (or not): what is wanted from
@@ -74,7 +113,7 @@ impl Transport {
     /// The track is open: it plays if that was asked and is still wanted.
     pub fn load(&self, path: String, start_ms: u64, play: bool, generation: u64) {
         let wanted = self.wanted();
-        let _ = self.tx.send(Command::Load {
+        self.send(Command::Load {
             path,
             start_ms,
             play: play && wanted.playing,
@@ -83,18 +122,24 @@ impl Transport {
     }
 
     pub fn queue(&self, queued: Option<Queued>) {
-        let _ = self.tx.send(Command::Queue(queued));
+        self.send(Command::Queue(queued));
     }
 
     pub fn seek(&self, secs: f64) {
-        let _ = self.tx.send(Command::Seek(secs));
+        self.send(Command::Seek(secs));
+    }
+
+    /// Anything else for the engine (another output: [`Command::Output`]).
+    pub fn command(&self, command: Command) {
+        self.send(command);
     }
 
     pub fn stop(&self) {
         let mut wanted = self.wanted();
         wanted.playing = false;
         wanted.resume = false;
-        let _ = self.tx.send(Command::Stop);
+        self.paused();
+        self.send(Command::Stop);
     }
 
     /// The system's word, acted on at once (on its thread).
@@ -104,17 +149,19 @@ impl Transport {
             Interrupt::Hidden | Interrupt::FocusLost | Interrupt::Noisy => {
                 wanted.playing = false;
                 wanted.resume = false;
-                let _ = self.tx.send(Command::Pause);
+                self.paused();
+                self.send(Command::Pause);
             }
             Interrupt::FocusLostForNow => {
                 wanted.resume |= wanted.playing;
                 wanted.playing = false;
-                let _ = self.tx.send(Command::Pause);
+                self.paused();
+                self.send(Command::Pause);
             }
             Interrupt::FocusBack => {
                 if std::mem::take(&mut wanted.resume) {
                     wanted.playing = true;
-                    let _ = self.tx.send(Command::Play);
+                    self.send(Command::Play);
                 }
             }
         }

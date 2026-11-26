@@ -77,6 +77,37 @@ for abi in "${ABIS[@]}"; do
 done
 printf '%s\n' "$libs"
 
+# 16 KB pages (Android 15 on some devices): every native library's LOAD
+# segments aligned to 16 KB at least, and stored page-aligned in the APK -
+# else UnsatisfiedLinkError at the start on such a device.
+READELF=${ANDROID_NDK_HOME:+$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf}
+if [ -n "$READELF" ] && [ -x "$READELF" ]; then
+    so_dir=$(mktemp -d)
+    for so in $(printf '%s\n' "$libs" | awk '{print $NF}'); do
+        unzip -p "$APK" "$so" > "$so_dir/lib.so"
+        bad=""
+        for align in $("$READELF" -lW "$so_dir/lib.so" | awk '$1 == "LOAD" { print $NF }'); do
+            [ $((align)) -ge 16384 ] || bad="$bad $align"
+        done
+        if [ -n "$bad" ]; then
+            echo "$so: LOAD segments aligned to $bad" | annotate error "not 16 KB aligned: $so"
+            exit 1
+        fi
+        echo "$so: LOAD segments 16 KB aligned"
+    done
+    rm -rf "$so_dir"
+else
+    echo "::warning::no llvm-readelf (ANDROID_NDK_HOME): the 16 KB alignment of the libraries is not checked"
+fi
+ZIPALIGN=$(ls -d "$ANDROID_HOME"/build-tools/*/zipalign 2>/dev/null | sort -V | tail -1)
+if [ -n "$ZIPALIGN" ]; then
+    if ! out=$("$ZIPALIGN" -c -P 16 -v 4 "$APK" 2>&1); then
+        printf '%s\n' "$out" | grep -v -E '\(OK' | tail -n 30 | annotate error "zipalign: not 16 KB page-aligned"
+        exit 1
+    fi
+    echo "zipalign: page-aligned for 16 KB"
+fi
+
 {
     grep -E '^Verified using|^Verifies' "$verify" || true
     echo "certificate SHA-256 $GOT"

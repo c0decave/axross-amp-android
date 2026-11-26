@@ -144,11 +144,13 @@ fn the_window_never_waits_on_a_busy_provider() {
         uri: format!("content://test{}", music.join(name).display()),
         folder: String::new(),
         name: name.to_owned(),
+        size: None,
     };
     let stuck = Picked {
         uri: "content://stuck/3".into(),
         folder: String::new(),
         name: "3 three.mp3".into(),
+        size: None,
     };
 
     let mut player = Player::start(Some(dir.join("open")), open_fd, true, || {});
@@ -250,6 +252,7 @@ fn a_seek_while_the_track_opens_waits_for_it() {
             uri: "content://stuck/1".into(),
             folder: String::new(),
             name: "1 one.mp3".into(),
+            size: None,
         }],
         false,
     );
@@ -266,5 +269,231 @@ fn a_seek_while_the_track_opens_waits_for_it() {
     assert_eq!(player.shown_position(), 500.0);
     player.seek(f64::NAN);
     assert_eq!(player.seek_pending(), Some(500.0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- the retries of tracks still being copied (the audit's M1, M2) ------------------------------
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// How often each document was handed over.
+static OPENED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+fn counted_open_fd(uri: &str) -> Option<i32> {
+    *OPENED
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .entry(uri.to_owned())
+        .or_default() += 1;
+    open_fd(uri)
+}
+
+fn opened(uri: &str) -> usize {
+    OPENED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(uri).copied())
+        .unwrap_or(0)
+}
+
+/// A file being copied in: written to just now (and kept so by `touch`).
+fn being_copied(path: &Path) {
+    std::fs::write(path, b"ID3 a quarter of it").unwrap();
+}
+
+fn touch(path: &Path) {
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::now())
+        .unwrap();
+}
+
+fn pump_until(player: &mut Player, what: &str, until: impl Fn(&Player) -> bool) {
+    let begun = Instant::now();
+    while !until(player) {
+        assert!(
+            begun.elapsed() < Duration::from_secs(10),
+            "{what}: not within 10 s (status {:?})",
+            player.status
+        );
+        player.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn picked(path: &Path, name: &str) -> Picked {
+    Picked {
+        uri: format!("content://test{}", path.display()),
+        folder: String::new(),
+        name: name.to_owned(),
+        size: None,
+    }
+}
+
+#[test]
+fn a_pause_while_a_copy_is_waited_for_stays_a_pause() {
+    let dir = scratch("retry-pause");
+    let track = dir.join("1 one.mp3");
+    being_copied(&track);
+    let mut player = Player::start(Some(dir.join("open")), counted_open_fd, true, || {});
+    player.set_copying_wait(Duration::from_millis(100));
+    player.set_picked(vec![picked(&track, "1 one.mp3")], true);
+    pump_until(&mut player, "still being copied", |p| p.retrying());
+    // (the user's pause: no retry, nothing starts by itself)
+    player.pause();
+    assert!(!player.retrying());
+    // (play again: tried at once; then the system hides the app)
+    touch(&track);
+    assert!(player.toggle());
+    pump_until(&mut player, "still being copied again", |p| p.retrying());
+    let before = opened(&picked(&track, "").uri);
+    player
+        .transport
+        .interrupt(crate::platform::Interrupt::Hidden);
+    std::thread::sleep(Duration::from_millis(250));
+    for _ in 0..20 {
+        player.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!player.retrying());
+    assert!(!player.transport.wants_playing());
+    assert_eq!(
+        opened(&picked(&track, "").uri),
+        before,
+        "opened again after a pause"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_retry_round_tries_one_track_and_a_stalled_copy_is_given_up() {
+    let dir = scratch("retry-one");
+    let one = dir.join("1 one.mp3");
+    let two = dir.join("2 two.mp3");
+    being_copied(&one);
+    being_copied(&two);
+    let mut player = Player::start(Some(dir.join("open")), counted_open_fd, true, || {});
+    player.set_copying_wait(Duration::from_millis(400));
+    player.set_picked(
+        vec![picked(&one, "1 one.mp3"), picked(&two, "2 two.mp3")],
+        true,
+    );
+    pump_until(&mut player, "both still being copied", |p| p.retrying());
+    let (one_uri, two_uri) = (picked(&one, "").uri, picked(&two, "").uri);
+    let (a, b) = (opened(&one_uri), opened(&two_uri));
+    assert_eq!((a, b), (1, 1));
+    // (a round: one of them only - the one that waited longest)
+    pump_until(&mut player, "a retry", |_| opened(&one_uri) == 2);
+    assert_eq!(opened(&two_uri), 1);
+    std::thread::sleep(Duration::from_millis(100));
+    player.pump();
+    assert_eq!(opened(&two_uri), 1);
+    // (the next round: the other one)
+    pump_until(&mut player, "the other's retry", |_| opened(&two_uri) == 2);
+    assert_eq!(opened(&one_uri), 2);
+    player.set_copying_wait(Duration::from_millis(5));
+    // (it does not grow: after a few rounds it is a failure, not a wait
+    // for ever)
+    pump_until(&mut player, "given up", |p| {
+        p.status.contains("does not go on")
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_sound_output_is_asked_for_again_with_growing_waits() {
+    use crate::player::{output_lost, output_wait};
+    assert!(output_lost(
+        "no sound: the output keeps failing - choose one in the Mixer tab"
+    ));
+    assert!(output_lost("no sound: no audio device"));
+    assert!(!output_lost("AAudio (48000 Hz)"));
+    assert!(!output_lost("no device (headless)"));
+    let waits: Vec<u64> = (0..6).map(|t| output_wait(t).as_secs()).collect();
+    assert_eq!(waits, [5, 10, 20, 30, 30, 30]);
+}
+
+#[test]
+fn a_copy_is_waited_for_longer_each_time_it_has_not_grown() {
+    use crate::player::{COPYING_RETRY, COPYING_WAIT_MOST, copying_wait};
+    assert_eq!(copying_wait(0, COPYING_RETRY), COPYING_RETRY);
+    assert_eq!(copying_wait(1, COPYING_RETRY), COPYING_RETRY * 2);
+    assert_eq!(copying_wait(2, COPYING_RETRY), COPYING_RETRY * 4);
+    assert_eq!(copying_wait(30, COPYING_RETRY), COPYING_WAIT_MOST);
+}
+
+// -- the decoders on files cut short and damaged (the audit's fuzz) ----------------------------
+
+/// The decoders on every fixture cut at many places (a file still being
+/// copied in) and with bytes overwritten: probe and decode end - with an
+/// error or with what is there - and neither panics nor takes longer than
+/// a few seconds. Run in the dev profile: overflow checks on.
+#[test]
+fn the_decoders_survive_files_cut_short_and_damaged() {
+    let dir = scratch("fuzz");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixtures = [
+        root.join("tests/media/sine.mp3"),
+        root.join("tests/media/sine.flac"),
+        root.join("axross-amp/tests/media/chirp.opus"),
+        root.join("axross-amp/tests/media/capture.ogg"),
+        root.join("axross-amp/tests/media/vbr-noxing-short.mp3"),
+    ];
+    let mut problems = Vec::new();
+    let mut runs = 0;
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    for source in fixtures.iter().filter(|p| p.exists()) {
+        let data = std::fs::read(source).unwrap();
+        let ending = source.extension().unwrap().to_string_lossy().into_owned();
+        let name = source.file_name().unwrap().to_string_lossy().into_owned();
+        let len = data.len();
+        let mut cuts: Vec<usize> = (0..16).chain([100, 400, 1000, 4096]).collect();
+        cuts.extend((1..24).map(|k| len * k / 24));
+        cuts.retain(|c| *c < len);
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut cases: Vec<(String, Vec<u8>)> = cuts
+            .into_iter()
+            .map(|cut| (format!("{name} cut at {cut}/{len}"), data[..cut].to_vec()))
+            .collect();
+        for k in 0..16 {
+            let mut damaged = data.clone();
+            let at = if k < 6 { (k * 7) % len } else { len * k / 16 };
+            let n = [1usize, 4, 16, 64][k % 4];
+            for byte in damaged.iter_mut().skip(at).take(n) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *byte = seed as u8;
+            }
+            cases.push((format!("{name} damaged at {at} ({n} bytes)"), damaged));
+        }
+        for (i, (what, bytes)) in cases.into_iter().enumerate() {
+            let path = dir.join(format!("{i}.{ending}"));
+            std::fs::write(&path, &bytes).unwrap();
+            runs += 1;
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let file = path.to_string_lossy().into_owned();
+            std::thread::spawn(move || {
+                let outcome = std::panic::catch_unwind(|| {
+                    let _ = engine::probe(&file);
+                    let _ = engine::decode_file(&file, 48_000);
+                });
+                let _ = tx.send(outcome.is_ok());
+            });
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(true) => {}
+                Ok(false) => problems.push(format!("panic: {what}")),
+                Err(_) => problems.push(format!("over 10 s: {what}")),
+            }
+        }
+    }
+    assert!(runs > 200, "only {runs} decodes");
+    assert!(problems.is_empty(), "{runs} decodes: {problems:#?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

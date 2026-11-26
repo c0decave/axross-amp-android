@@ -8,7 +8,7 @@ use crate::amp::playlist::{self, Playlist};
 use crate::amp::state::Track;
 use crate::opener::Failure;
 use crate::picked::{self, Picked};
-use crate::source::{Reply, Request, Source};
+use crate::source::{Queue, Reply, Request, Source};
 use crate::transport::{PastEnd, SeekTo, Transport, seek_to};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,9 +20,33 @@ use std::time::{Duration, Instant};
 /// (a folder of files it cannot read does not spin through all of them).
 const FAILURES_IN_A_ROW: u32 = 8;
 
-/// A track found still being copied is not tried again before this, and
-/// when every track left was, the player tries again after it.
+/// A track found still being copied is tried again after this, then after
+/// twice as long each time it has not grown ([`copying_wait`]), up to
+/// [`COPYING_WAIT_MOST`]; after [`COPYING_ROUNDS`] looks without growth the
+/// copy is taken to be stalled - a failure.
 pub const COPYING_RETRY: Duration = Duration::from_secs(10);
+pub const COPYING_WAIT_MOST: Duration = Duration::from_secs(120);
+pub const COPYING_ROUNDS: u32 = 6;
+
+/// How long a track that was still being copied `rounds` times without
+/// growing waits before it is tried again.
+pub fn copying_wait(rounds: u32, base: Duration) -> Duration {
+    base.saturating_mul(1u32 << rounds.min(16))
+        .min(COPYING_WAIT_MOST.max(base))
+}
+
+/// Whether the engine's word on its output means there is no sound (a
+/// device gone for good, Bluetooth that keeps dropping: the desktop's
+/// engine then gives up and waits to be told another output).
+pub fn output_lost(said: &str) -> bool {
+    said.starts_with("no sound")
+}
+
+/// How long the player waits before it asks the engine for the output
+/// again, the `tries`-th time: 5 s, 10 s, 20 s, then every 30 s.
+pub fn output_wait(tries: u32) -> Duration {
+    Duration::from_secs((5u64 << tries.min(3)).min(30))
+}
 
 /// What changed while [`Player::pump`] read the engine's events.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,8 +55,21 @@ pub struct Changed {
     pub track: bool,
 }
 
+/// A track found still being copied.
+#[derive(Clone, Copy, Debug)]
+struct Copying {
+    /// When it was found so last.
+    since: Instant,
+    /// Its size then.
+    size: u64,
+    /// The looks in a row it had not grown.
+    rounds: u32,
+}
+
 pub struct Player {
     engine: Engine,
+    headless: bool,
+    wake: Arc<dyn Fn() + Send + Sync>,
     pub transport: Arc<Transport>,
     source: Source,
     pub playlist: Playlist,
@@ -50,17 +87,33 @@ pub struct Player {
     /// A line to show: why a track did not play, the end of the list.
     pub status: String,
     failures: u32,
-    /// The pick so far (a folder's tracks come in batches).
+    /// The current track did not open (it failed, or was still being
+    /// copied) and nothing else plays: Play opens it again.
+    stalled: bool,
+    /// The pick so far (a folder's tracks come in batches), and what the
+    /// provider says each document holds.
     picked: Vec<Picked>,
-    /// Tracks found still being copied, and when.
-    copying: HashMap<String, Instant>,
+    sizes: HashMap<String, u64>,
+    /// Tracks found still being copied.
+    copying: HashMap<String, Copying>,
+    copying_base: Duration,
     /// Every track left was still being copied while music was wanted: the
-    /// player tries again then.
+    /// player tries the first of them again then - and plays it only if no
+    /// pause came between (the transport's count).
     retry_at: Option<Instant>,
+    retry_pauses: u64,
+    /// The track opening now is such a retry: if it is still being copied,
+    /// the next round waits - no other track is opened in this one.
+    in_retry: bool,
     /// A seek asked for while the track was still opening (done when it is
-    /// open), and the last seek asked for (shown until the sound is there).
-    seek_pending: Option<f64>,
+    /// open, as asked: a skip or a wind), and the last seek asked for
+    /// (shown until the sound is there).
+    seek_pending: Option<(f64, PastEnd)>,
     seek_asked: Option<(f64, Instant)>,
+    /// No sound output: when the engine is asked for it again, and how
+    /// often it was.
+    output_retry: Option<Instant>,
+    output_tries: u32,
 }
 
 impl Player {
@@ -72,15 +125,17 @@ impl Player {
         headless: bool,
         wake: impl Fn() + Send + Sync + Clone + 'static,
     ) -> Player {
-        let engine = if headless {
-            Engine::start_headless(wake.clone())
-        } else {
-            Engine::start(wake.clone())
-        };
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
+        let engine = new_engine(headless, &wake);
         let transport = Arc::new(Transport::new(engine.tx.clone()));
-        let source = Source::start(transport.clone(), cache, open_fd, wake);
+        let source = {
+            let wake = wake.clone();
+            Source::start(transport.clone(), cache, open_fd, move || wake())
+        };
         Player {
             engine,
+            headless,
+            wake,
             transport,
             source,
             playlist: Playlist::default(),
@@ -93,11 +148,32 @@ impl Player {
             duration: None,
             status: String::new(),
             failures: 0,
+            stalled: false,
             picked: Vec::new(),
+            sizes: HashMap::new(),
             copying: HashMap::new(),
+            copying_base: COPYING_RETRY,
             retry_at: None,
+            retry_pauses: 0,
+            in_retry: false,
             seek_pending: None,
             seek_asked: None,
+            output_retry: None,
+            output_tries: 0,
+        }
+    }
+
+    /// A new engine, after the old one ended while the app rested hidden
+    /// ([`crate::rest`]): the current track is opened again where it was,
+    /// paused.
+    pub fn new_engine(&mut self) {
+        let at = self.position();
+        self.engine = new_engine(self.headless, &self.wake);
+        self.transport.set_engine(self.engine.tx.clone());
+        self.loaded = None;
+        self.queued = None;
+        if let Some(index) = self.playlist.current.filter(|_| !self.stalled) {
+            self.play_index(index, (at.max(0.0) * 1000.0) as u64, false);
         }
     }
 
@@ -175,11 +251,7 @@ impl Player {
             return self.set_picked(all, play);
         }
         self.picked.extend(more);
-        let current = self
-            .playlist
-            .current
-            .and_then(|i| self.playlist.tracks.get(i))
-            .map(|t| t.path.clone());
+        let current = self.current_uri();
         let tracks = self.picked_tracks();
         let index = current.and_then(|uri| tracks.iter().position(|t| t.path == uri));
         let shuffle = self.playlist.shuffle;
@@ -195,6 +267,11 @@ impl Player {
 
     fn picked_tracks(&mut self) -> Vec<Track> {
         picked::sort(&mut self.picked, playlist::natural_cmp);
+        self.sizes = self
+            .picked
+            .iter()
+            .filter_map(|p| Some((p.uri.clone(), p.size?)))
+            .collect();
         self.picked
             .iter()
             .map(|p| Track {
@@ -232,6 +309,8 @@ impl Player {
         };
         self.generation = self.new_generation();
         self.queued = None;
+        self.stalled = false;
+        self.in_retry = false;
         self.seek_pending = None;
         self.seek_asked = None;
         self.playlist.play(index);
@@ -242,6 +321,7 @@ impl Player {
         self.transport.intend(play);
         self.source.send(Request::Load {
             name: file_name(&track),
+            size: self.sizes.get(&track.path).copied(),
             uri: track.path,
             start_ms,
             play,
@@ -251,22 +331,35 @@ impl Player {
 
     /// Play, or pause what plays. False: there is nothing to play.
     pub fn toggle(&mut self) -> bool {
-        if self.playlist.current.is_none() {
+        let Some(current) = self.playlist.current else {
             return false;
-        }
+        };
         if self.transport.wants_playing() {
-            self.transport.pause();
+            self.pause();
+        } else if self.stalled {
+            // (it did not open before: once more, now)
+            self.copying.clear();
+            self.play_index(current, 0, true);
         } else {
             self.transport.play();
         }
         true
     }
 
+    /// Play (the audio focus came; or the user's play).
+    pub fn play(&mut self) {
+        if !self.transport.wants_playing() {
+            self.toggle();
+        }
+    }
+
     pub fn pause(&mut self) {
+        self.retry_at = None;
         self.transport.pause();
     }
 
     pub fn stop(&mut self) {
+        self.retry_at = None;
         self.transport.stop();
     }
 
@@ -285,7 +378,10 @@ impl Player {
 
     /// `secs` back (negative) or on from where the track is.
     pub fn skip(&mut self, secs: f64) {
-        let from = self.seek_pending.unwrap_or_else(|| self.shown_position());
+        let from = match self.seek_pending {
+            Some((at, _)) => at,
+            None => self.shown_position(),
+        };
         self.seek(from + secs);
     }
 
@@ -297,7 +393,7 @@ impl Player {
         let duration = if opening { None } else { self.duration };
         match seek_to(secs, duration, past_end) {
             SeekTo::Nowhere => {}
-            SeekTo::At(at) if opening => self.seek_pending = Some(at),
+            SeekTo::At(at) if opening => self.seek_pending = Some((at, past_end)),
             SeekTo::At(at) => {
                 if self.info.seekable {
                     self.transport.seek(at);
@@ -321,7 +417,7 @@ impl Player {
     /// for the track to open) until the sound has caught up with it, else
     /// the sound's.
     pub fn shown_position(&mut self) -> f64 {
-        if let Some(at) = self.seek_pending {
+        if let Some((at, _)) = self.seek_pending {
             return at;
         }
         let heard = self.position();
@@ -340,26 +436,37 @@ impl Player {
 
     /// The seek asked for while the track was opening (for the tests).
     pub fn seek_pending(&self) -> Option<f64> {
-        self.seek_pending
+        self.seek_pending.map(|(at, _)| at)
     }
 
-    /// The track after the current one that is worth trying: one not found
+    /// Whether the player waits to try a track still being copied again
+    /// (for the tests).
+    pub fn retrying(&self) -> bool {
+        self.retry_at.is_some()
+    }
+
+    /// The first wait before a track still being copied is tried again
+    /// (the tests shorten it).
+    pub fn set_copying_wait(&mut self, base: Duration) {
+        self.copying_base = base;
+    }
+
+    /// Whether `track` was found still being copied too short a while ago
+    /// to try it again.
+    fn waits(&self, track: &Track) -> bool {
+        self.copying
+            .get(&track.path)
+            .is_some_and(|c| c.since.elapsed() < copying_wait(c.rounds, self.copying_base))
+    }
+
+    /// The track after the current one that is worth trying: not one found
     /// still being copied a moment ago.
     fn next_playable(&mut self, ended: bool) -> Option<usize> {
-        let fresh = |copying: &HashMap<String, Instant>, track: &Track| {
-            copying
-                .get(&track.path)
-                .is_some_and(|at| at.elapsed() < COPYING_RETRY)
-        };
         let here = self.playlist.current;
         for _ in 0..self.playlist.tracks.len().max(1) {
             let i = self.playlist.next(ended)?;
-            let skip = self
-                .playlist
-                .tracks
-                .get(i)
-                .is_some_and(|t| fresh(&self.copying, t));
-            if !skip {
+            let waits = self.playlist.tracks.get(i).is_some_and(|t| self.waits(t));
+            if !waits {
                 return Some(i);
             }
             // (passed over: the list goes on from it)
@@ -371,9 +478,11 @@ impl Player {
         None
     }
 
-    /// The next track: at the end of one (`ended`) or because it was asked.
+    /// The next track: at the end of one (`ended`) or because it was asked,
+    /// playing if music is wanted (a track that ended while a pause came
+    /// does not start the next).
     pub fn next(&mut self, ended: bool) {
-        let play = ended || self.transport.wants_playing();
+        let play = self.transport.wants_playing();
         match self.next_playable(ended) {
             Some(i) => self.play_index(i, 0, play),
             None => {
@@ -407,8 +516,8 @@ impl Player {
                 }
                 Reply::Failed {
                     generation,
-                    failure: Failure::Copying(why),
-                } if generation == self.generation => self.copying(why),
+                    failure: Failure::Copying(why, size),
+                } if generation == self.generation => self.copying(why, size),
                 Reply::Failed {
                     generation,
                     failure: Failure::Failed(message),
@@ -453,39 +562,67 @@ impl Player {
                     generation,
                     message,
                 } if generation == self.generation => self.failed(message),
-                Event::Output(name) => log::info!(target: "axrossamp", "output: {name}"),
+                Event::Output(said) => self.output(said),
                 _ => {}
             }
         }
-        // every track left was still being copied: once more, a while later
+        // every track left was still being copied: one of them once more -
+        // the one whose wait ends first - playing only if no pause came
+        // meanwhile
         if self.retry_at.is_some_and(|at| Instant::now() >= at) {
             self.retry_at = None;
-            let first = self
-                .playlist
-                .tracks
-                .iter()
-                .position(|t| self.copying.contains_key(&t.path));
-            if let Some(i) = first {
-                self.copying.clear();
+            if self.transport.pauses() == self.retry_pauses
+                && let Some((i, _)) = self.next_retry()
+            {
                 self.play_index(i, 0, true);
+                self.in_retry = true;
             }
+        }
+        // no sound output: the engine is asked for it again, now and then
+        if self.output_retry.is_some_and(|at| Instant::now() >= at) {
+            self.output_retry = None;
+            platform_log(&format!(
+                "asking for the sound output again ({})",
+                self.output_tries
+            ));
+            self.transport.command(Command::Output(None));
         }
         self.sync_queue();
         changed
     }
 
+    /// The engine's word on its output.
+    fn output(&mut self, said: String) {
+        log::info!(target: "axrossamp", "output: {said}");
+        if output_lost(&said) {
+            // (the desktop's engine says to choose one in its Mixer tab - a
+            // tab this app has not; it is tried again here by itself)
+            let wait = output_wait(self.output_tries);
+            self.output_tries += 1;
+            self.output_retry = Some(Instant::now() + wait);
+            self.status = format!("No sound output - trying again in {} s", wait.as_secs());
+        } else if self.output_tries > 0 {
+            self.output_tries = 0;
+            self.output_retry = None;
+            if self.status.starts_with("No sound output") {
+                self.status.clear();
+            }
+        }
+    }
+
     fn take_info(&mut self, info: TrackInfo) {
         self.loaded = Some(self.generation);
         self.failures = 0;
+        self.stalled = false;
         self.status.clear();
         self.duration = info.duration.or(self.duration);
         self.info = info;
         if let Some(uri) = self.current_uri() {
             self.copying.remove(&uri);
         }
-        // (a seek asked for while it was opening)
-        if let Some(at) = self.seek_pending.take() {
-            self.seek(at);
+        // (a seek asked for while it was opening, as it was asked)
+        if let Some((at, past_end)) = self.seek_pending.take() {
+            self.seek_as(at, past_end);
         }
     }
 
@@ -496,31 +633,71 @@ impl Player {
             .map(|t| t.path.clone())
     }
 
-    /// The current track is still being copied: said, passed over for now
-    /// (it is not a failure), tried again later.
-    fn copying(&mut self, why: String) {
+    /// The current track is still being copied (`size` bytes so far):
+    /// said, passed over for now (it is not a failure), tried again later -
+    /// unless it has not grown for [`COPYING_ROUNDS`] looks.
+    fn copying(&mut self, why: String, size: u64) {
         let name = self.title();
-        if let Some(uri) = self.current_uri() {
-            self.copying.insert(uri, Instant::now());
+        let Some(uri) = self.current_uri() else {
+            return;
+        };
+        let rounds = match self.copying.get(&uri) {
+            Some(seen) if seen.size == size => seen.rounds + 1,
+            _ => 0,
+        };
+        if rounds >= COPYING_ROUNDS {
+            self.copying.remove(&uri);
+            return self.failed(format!("{why} - and the copy does not go on"));
         }
+        self.copying.insert(
+            uri,
+            Copying {
+                since: Instant::now(),
+                size,
+                rounds,
+            },
+        );
         log::info!(target: "axrossamp", "a track is {why}: passed over for now");
         let play = self.transport.wants_playing();
-        match self.next_playable(true) {
+        // (a retry's round opens no other track)
+        let next = if std::mem::take(&mut self.in_retry) {
+            None
+        } else {
+            self.next_playable(true)
+        };
+        match next {
             Some(i) => {
                 self.play_index(i, 0, play);
                 self.status = format!("{name}: {why} - tried again later");
             }
             None => {
+                let now = Instant::now();
+                let due = self.next_retry().map_or(now, |(_, due)| due.max(now));
                 self.stop();
+                self.stalled = true;
                 self.status = format!(
                     "{name}: {why} - trying again in {} s",
-                    COPYING_RETRY.as_secs()
+                    due.duration_since(now).as_secs().max(1)
                 );
                 if play {
-                    self.retry_at = Some(Instant::now() + COPYING_RETRY);
+                    self.retry_at = Some(due);
+                    self.retry_pauses = self.transport.pauses();
                 }
             }
         }
+    }
+
+    /// The track still being copied to try first, and when.
+    fn next_retry(&self) -> Option<(usize, Instant)> {
+        self.playlist
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                let c = self.copying.get(&t.path)?;
+                Some((i, c.since + copying_wait(c.rounds, self.copying_base)))
+            })
+            .min_by_key(|(_, due)| *due)
     }
 
     /// The current track did not open or play: said, and on to the next -
@@ -538,12 +715,17 @@ impl Player {
                 // (play_index starts a new track: the line about this one stays)
                 self.status = format!("{name}: {message}");
             }
-            _ => self.stop(),
+            _ => {
+                self.stop();
+                self.stalled = true;
+            }
         }
     }
 
     /// Names the track that follows the current one to the engine whenever
     /// that changes: it is opened and decoded on behind this one, no gap.
+    /// (The same track at another place in the list - a folder's batches
+    /// move it - is no change.)
     fn sync_queue(&mut self) {
         let want = if self.loaded == Some(self.generation) {
             self.playlist
@@ -552,23 +734,24 @@ impl Player {
         } else {
             None
         };
-        let same = match (&self.queued, &want) {
-            (Some((i, uri, _)), Some((wi, track))) => i == wi && *uri == track.path,
-            (None, None) => true,
-            _ => false,
-        };
-        if same {
-            return;
+        match (&mut self.queued, &want) {
+            (Some((i, uri, _)), Some((wi, track))) if *uri == track.path => {
+                *i = *wi;
+                return;
+            }
+            (None, None) => return,
+            _ => {}
         }
         match want {
             Some((index, track)) => {
                 let generation = self.new_generation();
                 self.queued = Some((index, track.path.clone(), generation));
-                self.source.send(Request::Queue(Some((
-                    track.path.clone(),
-                    file_name(&track),
+                self.source.send(Request::Queue(Some(Queue {
+                    uri: track.path.clone(),
+                    name: file_name(&track),
+                    size: self.sizes.get(&track.path).copied(),
                     generation,
-                ))));
+                })));
             }
             None => {
                 self.queued = None;
@@ -581,6 +764,20 @@ impl Player {
     pub fn send(&self, command: Command) {
         self.engine.send(command);
     }
+}
+
+fn new_engine(headless: bool, wake: &Arc<dyn Fn() + Send + Sync>) -> Engine {
+    let wake = wake.clone();
+    let wake = move || wake();
+    if headless {
+        Engine::start_headless(wake)
+    } else {
+        Engine::start(wake)
+    }
+}
+
+fn platform_log(text: &str) {
+    crate::platform::log_line(text);
 }
 
 /// A name with an ending for the opened document: the decoder's hint. The

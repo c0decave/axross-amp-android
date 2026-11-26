@@ -49,9 +49,40 @@ pub const SECOND_LOOK: Duration = Duration::from_millis(300);
 /// How long the system may take to hand over a document.
 pub const OPEN_TIME: Duration = Duration::from_secs(12);
 
-/// A copy (where a document cannot be opened in place) ends here.
+/// A copy (where a document cannot be opened in place) ends here; the
+/// copies kept come to no more than [`COPY_TOTAL`] (the oldest go first -
+/// never the one playing or the one queued behind it).
 pub const COPY_TIME: Duration = Duration::from_secs(60);
-pub const COPY_BYTES: u64 = 1 << 30;
+pub const COPY_BYTES: u64 = 512 << 20;
+pub const COPY_TOTAL: u64 = 512 << 20;
+
+/// At most this many documents are being opened at once: a provider that
+/// does not answer holds a thread each (until the Java side's cancel ends
+/// its call), and no more than these pile up.
+pub const OPENINGS: usize = 4;
+
+/// One of the [`OPENINGS`], given back when its worker ends.
+struct Slot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Slot {
+    fn take(count: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Slot> {
+        use std::sync::atomic::Ordering;
+        let mut now = count.load(Ordering::Acquire);
+        while now < OPENINGS {
+            match count.compare_exchange_weak(now, now + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Slot(count.clone())),
+                Err(seen) => now = seen,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 /// Whether `uri` is a document of a content provider (else: a path).
 pub fn is_document(uri: &str) -> bool {
@@ -61,8 +92,9 @@ pub fn is_document(uri: &str) -> bool {
 /// Why a document is not open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// Still being written (copied in): to be tried again later.
-    Copying(String),
+    /// Still being written (copied in) - its size so far - or the system
+    /// too busy to open it now: to be tried again later.
+    Copying(String, u64),
     /// It cannot be opened or read.
     Failed(String),
 }
@@ -70,7 +102,7 @@ pub enum Failure {
 impl Failure {
     pub fn message(&self) -> &str {
         match self {
-            Failure::Copying(m) | Failure::Failed(m) => m,
+            Failure::Copying(m, _) | Failure::Failed(m) => m,
         }
     }
 }
@@ -83,10 +115,15 @@ pub(crate) enum Said {
     Done(Result<Placed, Failure>),
 }
 
-pub(crate) struct Placed {
+pub struct Placed {
     path: PathBuf,
-    /// The descriptor the link points at (None: a copy).
+    /// The descriptor the link points at (None: a copy, or a plain path).
     file: Option<File>,
+    /// The bytes of a copy (0: no copy).
+    copied: u64,
+    /// The path is this app's (a link or a copy in the cache), not the
+    /// user's own file: it may be removed.
+    own: bool,
 }
 
 /// A document being opened on a thread of its own.
@@ -102,7 +139,7 @@ pub struct Opening {
 
 /// What an opening gave: the file's place in the cache and the descriptor
 /// its link points at (None: a copy), or why not.
-pub type Opened = Result<(PathBuf, Option<File>), Failure>;
+pub type Opened = Result<Placed, Failure>;
 
 impl Opening {
     /// The worker's messages, for a `select!`: each one goes to
@@ -121,7 +158,7 @@ impl Opening {
                 self.deadline = Instant::now() + COPY_TIME + Duration::from_secs(2);
                 None
             }
-            Ok(Said::Done(result)) => Some(result.map(|placed| (placed.path, placed.file))),
+            Ok(Said::Done(result)) => Some(result),
             Err(_) => Some(Err(Failure::Failed(
                 "the document could not be opened".into(),
             ))),
@@ -177,9 +214,12 @@ struct Open {
     path: PathBuf,
     /// The descriptor the link points at (None: a copy).
     _file: Option<File>,
+    copied: u64,
 }
 
 pub struct Opener {
+    /// The documents being opened now (see [`OPENINGS`]).
+    openings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     dir: Option<PathBuf>,
     open_fd: fn(&str) -> Option<i32>,
     open: VecDeque<Open>,
@@ -194,6 +234,7 @@ impl Opener {
             let _ = std::fs::create_dir_all(dir);
         }
         Opener {
+            openings: Default::default(),
             dir,
             open_fd,
             open: VecDeque::new(),
@@ -202,12 +243,10 @@ impl Opener {
     }
 
     /// Starts opening `uri` (named `name`, whose ending is the decoder's
-    /// hint). The caller waits on the [`Opening`] and hands what it gives to
+    /// hint; `size`: what the provider says it holds, where it says). The
+    /// caller waits on the [`Opening`] and hands what it gives to
     /// [`Opener::finish`].
-    pub fn begin(&mut self, uri: &str, name: &str) -> Begun {
-        if !is_document(uri) {
-            return Begun::Ready(uri.to_owned());
-        }
+    pub fn begin(&mut self, uri: &str, name: &str, size: Option<u64>) -> Begun {
         if let Some(at) = self.open.iter().position(|o| o.uri == uri) {
             // (used again: the last to go)
             let again = self.open.remove(at).expect("the place just found");
@@ -215,12 +254,23 @@ impl Opener {
             self.open.push_back(again);
             return Begun::Ready(path);
         }
-        let Some(dir) = self.dir.clone() else {
-            return Begun::Failed(Failure::Failed("no place to open documents in".into()));
+        let document = is_document(uri);
+        let path = if document {
+            let Some(dir) = self.dir.clone() else {
+                return Begun::Failed(Failure::Failed("no place to open documents in".into()));
+            };
+            self.count += 1;
+            let ending = picked::extension(name).unwrap_or_else(|| "bin".to_owned());
+            dir.join(format!("{}.{ending}", self.count))
+        } else {
+            PathBuf::from(uri)
         };
-        self.count += 1;
-        let ending = picked::extension(name).unwrap_or_else(|| "bin".to_owned());
-        let path = dir.join(format!("{}.{ending}", self.count));
+        let Some(slot) = Slot::take(&self.openings) else {
+            return Begun::Failed(Failure::Copying(
+                format!("the system is busy ({OPENINGS} documents still being opened)"),
+                0,
+            ));
+        };
         let (tx, said) = crossbeam_channel::unbounded();
         let (abandon, abandoned) = crossbeam_channel::bounded::<()>(0);
         let open_fd = self.open_fd;
@@ -229,13 +279,21 @@ impl Opener {
         let spawned = std::thread::Builder::new()
             .name("amp-open".into())
             .spawn(move || {
-                let result = open_and_place(open_fd, &target, &path, &tx, &abandoned);
-                // (no one waits any more: what was opened goes)
+                let _slot = slot;
+                let result = if document {
+                    open_and_place(open_fd, &target, &path, size, &tx, &abandoned)
+                } else {
+                    check_path(&path, size)
+                };
+                // (no one waits any more: what was opened goes - a link or a
+                // copy of ours, never the user's own file)
                 if let Err(crossbeam_channel::SendError(Said::Done(Ok(placed)))) =
                     tx.send(Said::Done(result))
                 {
                     drop(placed.file);
-                    let _ = std::fs::remove_file(&placed.path);
+                    if placed.own {
+                        let _ = std::fs::remove_file(&placed.path);
+                    }
                 }
             });
         if spawned.is_err() {
@@ -250,25 +308,42 @@ impl Opener {
         })
     }
 
-    /// The document an [`Opening`] opened, kept: its path.
-    pub fn finish(&mut self, uri: &str, path: PathBuf, file: Option<File>) -> String {
+    /// What an [`Opening`] opened, kept: its path. Older ones go to keep
+    /// [`KEEP`] and [`COPY_TOTAL`] - never one of `in_use` (the track
+    /// playing, the one queued behind it: the engine reads them again by
+    /// path when it seeks or the output changes).
+    pub fn finish(&mut self, uri: &str, placed: Placed, in_use: &[&str]) -> String {
+        let path = path_text(&placed.path);
+        if !placed.own {
+            // (a plain path: nothing of ours to keep or to remove)
+            return path;
+        }
         self.open.push_back(Open {
             uri: uri.to_owned(),
-            path: path.clone(),
-            _file: file,
+            path: placed.path,
+            _file: placed.file,
+            copied: placed.copied,
         });
-        while self.open.len() > KEEP {
-            if let Some(old) = self.open.pop_front() {
+        let pinned = |o: &Open| o.uri == uri || in_use.contains(&o.uri.as_str());
+        loop {
+            let copies: u64 = self.open.iter().map(|o| o.copied).sum();
+            if self.open.len() <= KEEP && copies <= COPY_TOTAL {
+                break;
+            }
+            let Some(at) = self.open.iter().position(|o| !pinned(o)) else {
+                break;
+            };
+            if let Some(old) = self.open.remove(at) {
                 let _ = std::fs::remove_file(&old.path);
             }
         }
-        path_text(&path)
+        path
     }
 
     /// Opens `uri` and waits for it, at most until its deadline (the tests;
     /// the player's thread waits on [`Opener::begin`] itself).
     pub fn open(&mut self, uri: &str, name: &str) -> Result<String, Failure> {
-        match self.begin(uri, name) {
+        match self.begin(uri, name, None) {
             Begun::Ready(path) => Ok(path),
             Begun::Failed(failure) => Err(failure),
             Begun::Opening(mut opening) => loop {
@@ -278,8 +353,7 @@ impl Opener {
                     return Err(Failure::Failed(too_slow()));
                 }
                 if let Some(result) = opening.wait(left) {
-                    let (path, file) = result?;
-                    return Ok(self.finish(uri, path, file));
+                    return Ok(self.finish(uri, result?, &[]));
                 }
             },
         }
@@ -309,6 +383,7 @@ fn open_and_place(
     open_fd: fn(&str) -> Option<i32>,
     uri: &str,
     path: &Path,
+    size: Option<u64>,
     tx: &Sender<Said>,
     abandoned: &Receiver<()>,
 ) -> Result<Placed, Failure> {
@@ -317,10 +392,42 @@ fn open_and_place(
     if abandoned_now(abandoned) {
         return Err(Failure::Failed("given up on".into()));
     }
-    if let Some(why) = still_written(&file, SystemTime::now(), || std::thread::sleep(SECOND_LOOK)) {
-        return Err(Failure::Copying(why));
-    }
+    ready(&file, size)?;
     place(file, path, tx, abandoned)
+}
+
+/// A plain path (the desktop preview, the emulator's test): whether it is
+/// there and still being written; it is played where it is.
+fn check_path(path: &Path, size: Option<u64>) -> Result<Placed, Failure> {
+    let file = File::open(path)
+        .map_err(|e| Failure::Failed(format!("the file cannot be opened ({e})")))?;
+    ready(&file, size)?;
+    Ok(Placed {
+        path: path.to_owned(),
+        file: None,
+        copied: 0,
+        own: false,
+    })
+}
+
+/// Whether `file` can be played now: not still being written, not smaller
+/// than the provider says it is.
+fn ready(file: &File, size: Option<u64>) -> Result<(), Failure> {
+    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+    match still_written(file, SystemTime::now(), || std::thread::sleep(SECOND_LOOK)) {
+        Some(Written::Copying(why)) => return Err(Failure::Copying(why, length)),
+        Some(Written::Empty) => return Err(Failure::Failed("the file is empty".into())),
+        None => {}
+    }
+    if let Some(size) = size.filter(|s| *s > 0)
+        && file.metadata().is_ok_and(|m| m.is_file() && m.len() < size)
+    {
+        return Err(Failure::Copying(
+            format!("still being copied ({length} of {size} bytes)"),
+            length,
+        ));
+    }
+    Ok(())
 }
 
 fn abandoned_now(abandoned: &Receiver<()>) -> bool {
@@ -348,33 +455,47 @@ fn owned(_fd: i32) -> Result<File, Failure> {
     ))
 }
 
-/// Why `file` is still being written (None: it is not, as far as can be
-/// told). Only a regular file is judged: a pipe has no size to look at.
+/// What [`still_written`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Written {
+    /// Still being written: why it seems so.
+    Copying(String),
+    /// Empty, and not changed for a while: not a copy under way.
+    Empty,
+}
+
+/// Whether `file` is still being written (None: it is not, as far as can
+/// be told). Only a regular file is judged: a pipe has no size to look at.
 /// `pause` waits between the two looks.
-pub fn still_written(file: &File, now: SystemTime, pause: impl FnOnce()) -> Option<String> {
+pub fn still_written(file: &File, now: SystemTime, pause: impl FnOnce()) -> Option<Written> {
     let first = file.metadata().ok()?;
     if !first.is_file() {
         return None;
-    }
-    if first.len() == 0 {
-        return Some("still being copied (empty so far)".into());
     }
     let age = first
         .modified()
         .ok()
         .and_then(|m| now.duration_since(m).ok())
         .unwrap_or(Duration::MAX);
+    if first.len() == 0 {
+        // (a copy that has just begun, or a file that is simply empty)
+        return Some(if age < SETTLING {
+            Written::Copying("still being copied (empty so far)".into())
+        } else {
+            Written::Empty
+        });
+    }
     if age < RECENT {
-        return Some(format!(
+        return Some(Written::Copying(format!(
             "still being copied (changed {:.1} s ago)",
             age.as_secs_f32()
-        ));
+        )));
     }
     if age < SETTLING {
         pause();
         let second = file.metadata().ok()?;
         if second.len() != first.len() || second.modified().ok() != first.modified().ok() {
-            return Some("still being copied (it grows)".into());
+            return Some(Written::Copying("still being copied (it grows)".into()));
         }
     }
     None
@@ -399,6 +520,8 @@ fn place(
         return Ok(Placed {
             path: path.to_owned(),
             file: Some(file),
+            copied: 0,
+            own: true,
         });
     }
     let _ = std::fs::remove_file(path);
@@ -413,6 +536,8 @@ fn place(
         Ok(bytes) if bytes > 0 => Ok(Placed {
             path: path.to_owned(),
             file: None,
+            copied: bytes,
+            own: true,
         }),
         Ok(_) => {
             let _ = std::fs::remove_file(path);
@@ -513,13 +638,33 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_path_is_itself() {
+    fn a_plain_path_is_itself_and_is_never_removed() {
+        let dir = scratch("plain");
+        let track = dir.join("a.flac");
+        settled(&track, b"fLaC and so on");
         let mut opener = Opener::new(None, open_fd);
-        assert_eq!(
-            opener.open("/music/a.flac", "a.flac").unwrap(),
-            "/music/a.flac"
-        );
+        let path = track.to_string_lossy().into_owned();
+        assert_eq!(opener.open(&path, "a.flac").unwrap(), path);
         assert_eq!(opener.kept(), 0);
+        // (given up on: the user's file stays)
+        let Begun::Opening(opening) = opener.begin(&path, "a.flac", None) else {
+            panic!("not opening");
+        };
+        opening.abandon();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(track.exists());
+        // (missing, or still being written: said so)
+        assert!(matches!(
+            opener.open("/no/such/file.mp3", "file.mp3"),
+            Err(Failure::Failed(_))
+        ));
+        let fresh = dir.join("fresh.mp3");
+        File::create(&fresh).unwrap().write_all(b"ID3").unwrap();
+        assert!(matches!(
+            opener.open(&fresh.to_string_lossy(), "fresh.mp3"),
+            Err(Failure::Copying(_, 3))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -595,6 +740,8 @@ mod tests {
         let file = owned(reader.into_raw_fd()).unwrap();
         let placed = place(file, &path, &tx, &abandoned).unwrap();
         assert!(placed.file.is_none());
+        assert_eq!(placed.copied, 14);
+        assert!(placed.own);
         assert!(matches!(said.try_recv(), Ok(Said::Copying)));
         assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
         assert_eq!(std::fs::read(&path).unwrap(), b"OggS and so on");
@@ -610,7 +757,18 @@ mod tests {
         File::create(&empty).unwrap();
         assert!(matches!(
             opener.open(&uri(&empty), "empty.flac"),
-            Err(Failure::Copying(_))
+            Err(Failure::Copying(_, 0))
+        ));
+        // (empty for a while: no copy under way, a failure)
+        File::options()
+            .write(true)
+            .open(&empty)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+        assert!(matches!(
+            opener.open(&uri(&empty), "empty.flac"),
+            Err(Failure::Failed(m)) if m.contains("empty")
         ));
         // (written to a moment ago)
         let fresh = dir.join("fresh.mp3");
@@ -620,7 +778,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             opener.open(&uri(&fresh), "fresh.mp3"),
-            Err(Failure::Copying(_))
+            Err(Failure::Copying(_, 8))
         ));
         // (a while ago: a whole file)
         settled(&fresh, b"ID3 whole");
@@ -642,7 +800,7 @@ mod tests {
         let why = still_written(&reader, SystemTime::now(), || {
             writer.write_all(b" and more").unwrap();
         });
-        assert!(why.is_some_and(|w| w.contains("grows")));
+        assert!(matches!(why, Some(Written::Copying(w)) if w.contains("grows")));
         // (the same, untouched between the looks: done)
         let settled_at = SystemTime::now() - Duration::from_secs(30);
         File::options()
@@ -667,7 +825,8 @@ mod tests {
         let dir = scratch("stuck");
         let mut opener = Opener::new(Some(dir.join("open")), stuck);
         let begun = Instant::now();
-        let Begun::Opening(mut opening) = opener.begin("content://slow/a.mp3", "a.mp3") else {
+        let Begun::Opening(mut opening) = opener.begin("content://slow/a.mp3", "a.mp3", None)
+        else {
             panic!("not opening");
         };
         // (beginning does not wait)
@@ -703,6 +862,73 @@ mod tests {
         let (gone, abandoned) = crossbeam_channel::bounded::<()>(0);
         drop(gone);
         assert!(copy(File::open(&from).unwrap(), &to, 1 << 20, far, &abandoned).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_smaller_than_the_provider_says_is_still_being_copied() {
+        let dir = scratch("size");
+        let track = dir.join("half.mp3");
+        settled(&track, b"ID3 half");
+        let mut opener = Opener::new(Some(dir.join("open")), open_fd);
+        let Begun::Opening(mut opening) = opener.begin(&uri(&track), "half.mp3", Some(100)) else {
+            panic!("not opening");
+        };
+        assert!(matches!(
+            opening.wait(Duration::from_secs(5)),
+            Some(Err(Failure::Copying(m, 8))) if m.contains("8 of 100")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_track_playing_and_the_one_queued_are_never_let_go_of() {
+        let dir = scratch("pinned");
+        let music = dir.join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        let mut opener = Opener::new(Some(dir.join("open")), open_fd);
+        let open = |opener: &mut Opener, name: &str, in_use: &[&str]| {
+            let track = music.join(name);
+            settled(&track, name.as_bytes());
+            let Begun::Opening(mut opening) = opener.begin(&uri(&track), name, None) else {
+                panic!("not opening");
+            };
+            let placed = opening.wait(Duration::from_secs(5)).unwrap().unwrap();
+            opener.finish(&uri(&track), placed, in_use)
+        };
+        let playing_uri = uri(&music.join("playing.mp3"));
+        let queued_uri = uri(&music.join("queued.mp3"));
+        let playing = open(&mut opener, "playing.mp3", &[]);
+        let queued = open(&mut opener, "queued.mp3", &[&playing_uri]);
+        // (one long track: ten others opened to follow it, one after another)
+        for i in 0..10 {
+            open(
+                &mut opener,
+                &format!("{i}.mp3"),
+                &[&playing_uri, &queued_uri],
+            );
+        }
+        assert_eq!(std::fs::read(&playing).unwrap(), b"playing.mp3");
+        assert_eq!(std::fs::read(&queued).unwrap(), b"queued.mp3");
+        assert_eq!(opener.kept(), KEEP);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_more_than_a_few_openings_wait_on_a_provider_at_once() {
+        let dir = scratch("openings");
+        let mut opener = Opener::new(Some(dir.join("open")), stuck);
+        let mut waiting = Vec::new();
+        let mut busy = 0;
+        for i in 0..OPENINGS + 2 {
+            match opener.begin(&format!("content://slow/{i}.mp3"), "x.mp3", None) {
+                Begun::Opening(opening) => waiting.push(opening),
+                Begun::Failed(Failure::Copying(m, _)) if m.contains("busy") => busy += 1,
+                _ => panic!("unexpected"),
+            }
+        }
+        assert_eq!((waiting.len(), busy), (OPENINGS, 2));
+        drop(waiting);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
