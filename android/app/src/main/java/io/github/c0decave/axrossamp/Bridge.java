@@ -53,6 +53,7 @@ final class Bridge {
     static final int CALL_REQUEST_FOCUS = 4;
     static final int CALL_ABANDON_FOCUS = 5;
     static final int CALL_LEAVE = 6;
+    static final int CALL_SCREEN_ON = 7;
 
     // Java -> Rust (event)
     static final int EVENT_INSETS = 1;
@@ -308,6 +309,19 @@ final class Bridge {
                 case CALL_LEAVE:
                     activity.runOnUiThread(() -> activity.moveTaskToBack(true));
                     return 0;
+                case CALL_SCREEN_ON: {
+                    // (posted: never waited for - see keep_screen_on in
+                    // src/platform/android.rs)
+                    boolean on = "1".equals(arg);
+                    activity.runOnUiThread(() -> {
+                        if (on) {
+                            activity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        } else {
+                            activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        }
+                    });
+                    return 0;
+                }
                 default:
                     Log.w(TAG, "unknown call " + what);
                     return -1;

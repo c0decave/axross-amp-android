@@ -1,7 +1,7 @@
 //! Android's end of the seam: JNI to the activity (`MainActivity.bridgeCall`,
 //! `Bridge.nativeEvent`), the NDK for the window's flags and the log.
 
-use android_activity::{AndroidApp, WindowManagerFlags};
+use android_activity::AndroidApp;
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::jint;
 use jni::{EnvUnowned, JavaVM, jni_sig, jni_str};
@@ -79,14 +79,16 @@ pub extern "system" fn Java_io_github_c0decave_axrossamp_Bridge_nativeEvent<'cal
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
+/// The screen kept on or not: by the Java side, on its main thread.
+///
+/// Not by android-activity's `set_window_flags`: that holds the
+/// NativeActivity glue's lock while `ANativeActivity_setWindowFlags` waits
+/// on the main thread - and the main thread, in onPause, waits for that
+/// lock. Both threads stopped for good, the moment music began to play
+/// (the first track played on, the app hung: CI's smoke test caught it,
+/// "amp-system: still setting the window's flags").
 pub fn keep_screen_on(on: bool) {
-    let Some(app) = app() else { return };
-    let flag = WindowManagerFlags::KEEP_SCREEN_ON;
-    if on {
-        app.set_window_flags(flag, WindowManagerFlags::empty());
-    } else {
-        app.set_window_flags(WindowManagerFlags::empty(), flag);
-    }
+    call(super::CALL_SCREEN_ON, if on { "1" } else { "0" });
 }
 
 #[link(name = "log")]

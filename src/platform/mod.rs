@@ -30,6 +30,8 @@ pub const CALL_OPEN_FD: i32 = 3;
 pub const CALL_REQUEST_FOCUS: i32 = 4;
 pub const CALL_ABANDON_FOCUS: i32 = 5;
 pub const CALL_LEAVE: i32 = 6;
+/// The screen kept on ("1") or not ("0").
+pub const CALL_SCREEN_ON: i32 = 7;
 
 // Java -> Rust (Bridge.event)
 pub const EVENT_INSETS: i32 = 1;
