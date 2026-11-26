@@ -34,6 +34,8 @@ inspect() {
 step "The Rust side for Android (clippy, no warnings)" clippy
 step "Debug APK (arm64-v8a and x86_64)" "${GRADLE[@]}" assembleDebug
 step "What is in the APK" inspect
+# (the release's signature check, rehearsed on the debug APK)
+step "The APK's signature (scripts/ci/verify-apk.sh)" bash scripts/ci/verify-apk.sh "$APK" "" arm64-v8a x86_64
 {
     echo "$(basename "$APK"): $(stat -c %s "$APK") bytes, sha256 $(sha256sum "$APK" | cut -d' ' -f1)"
     unzip -l "$APK" | grep -E 'lib/.*\.so' || true
