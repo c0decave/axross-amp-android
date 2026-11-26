@@ -22,8 +22,26 @@ public final class MainActivity extends NativeActivity {
 
     private Bridge bridge;
 
+    /** An activity of this process has started android_main already. */
+    private static boolean started;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // One android_main a process (winit makes one event loop a process):
+        // a second activity in the same one - the system or a launcher
+        // starting it again before the first one is destroyed (a new task
+        // over the old, CLEAR_TASK) - would start a second android_main that
+        // cannot draw. So this one is started afresh, in a new process, and
+        // this process ends now, before any native code runs again.
+        if (started) {
+            Log.i("axrossamp", "a second activity in one process: started afresh in a new one");
+            Intent again = new Intent(getIntent());
+            again.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            startActivity(again);
+            Process.killProcess(Process.myPid());
+            return;
+        }
+        started = true;
         // (before super.onCreate: that starts android_main, which may call
         // bridgeCall at once)
         bridge = new Bridge(this);

@@ -179,16 +179,27 @@ impl Screen {
         // measurement waits on the GPU, so it runs on a thread of its own:
         // the faces are on the CPU until it is done.
         viz_state.set_gpu(false);
-        let gpu_check = cc.wgpu_render_state.as_ref().map(|render_state| {
+        let gpu_check = cc.wgpu_render_state.as_ref().and_then(|render_state| {
             guard_gpu(render_state, config.data.clone(), config.vulkan);
             let info = render_state.adapter.get_info();
             platform::log_line(&format!(
                 "renderer: {:?} on {} ({:?})",
                 info.backend, info.name, info.device_type
             ));
-            (check_gpu(render_state.clone()), ctx.input(|i| i.time))
+            // (a software rasterizer - the emulator's: nothing to measure;
+            // and with OpenGL ES the measuring thread holds the one GL
+            // context the window's surface needs, so the start - and
+            // Android's main thread with it - would wait seconds for it)
+            if info.device_type == eframe::wgpu::DeviceType::Cpu {
+                viz_state.gpu.max_pixels = 90_000.0;
+                platform::log_line(
+                    "shader faces on the CPU, small (a software rasterizer: not measured)",
+                );
+                return None;
+            }
+            Some((check_gpu(render_state.clone()), ctx.input(|i| i.time)))
         });
-        if gpu_check.is_none() {
+        if cc.wgpu_render_state.is_none() {
             platform::log_line("renderer: no wgpu; shader faces on the CPU");
         }
         if !config.tracks.is_empty() {
