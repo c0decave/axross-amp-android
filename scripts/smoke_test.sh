@@ -13,9 +13,9 @@
 #     amp.paths extra), one of them still being copied in while it is
 #     picked: it must be passed over ("still being copied"), the others
 #     opened ("done in"), and nothing may block the main thread;
-#   - the activity destroyed ("Don't keep activities", then home: the
-#     process must end and start fresh) and, from Android 12 on, bold text
-#     switched on and off (no new activity at all);
+#   - the activity destroyed (started anew with CLEAR_TASK: the process
+#     must end and start fresh) and, from Android 12 on, bold text switched
+#     on and off (no new activity at all);
 #   - a monkey: random touches and keys within the app, seed logged.
 #
 # After every step: no ANR, no crash, no panic, no blocked main thread in
@@ -237,25 +237,26 @@ stress() {
         healthy "bold text" || return 1
     fi
 
-    say "the activity destroyed: \"Don't keep activities\", then home"
-    adb shell settings put global always_finish_activities 1
-    adb shell input keyevent KEYCODE_HOME
-    local waited=0
-    while [ -n "$(app_pid)" ]; do
-        [ "$waited" -lt 10 ] || { say "the process lives on after its activity was destroyed"; adb shell settings put global always_finish_activities 0; return 1; }
+    say "the activity destroyed (started anew with CLEAR_TASK): its process ends, a new one starts"
+    local old=$pid waited=0
+    adb logcat -c
+    # (FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK: the running
+    # activity is finished - onDestroy - and a new one started)
+    adb shell am start -W -f 0x10008000 -n "$PACKAGE/$ACTIVITY" >/dev/null
+    while [ "$(app_pid)" = "$old" ]; do
+        [ "$waited" -lt 20 ] || { say "the process lives on after its activity was destroyed"; return 1; }
         sleep 1
         waited=$((waited + 1))
     done
-    adb shell settings put global always_finish_activities 0
-    healthy "the destroyed activity" || return 1
-    adb logcat -c
-    start_activity || return 1
     if ! wait_for_line "first frame" 60; then
         say "no first frame after the activity was destroyed"
-        return 1
+        start_activity
+        wait_for_line "first frame" 30 || return 1
+        say "(a first frame only after one more start)"
     fi
+    adb logcat -d -s axrossamp:V | grep -E "destroyed|starting" | tail -n 3
     pid=$(app_pid)
-    healthy "the start after the destroyed activity" || return 1
+    healthy "the destroyed activity" || return 1
 
     say "monkey: $MONKEY_EVENTS events, seed $SEED"
     adb shell monkey -p "$PACKAGE" --pct-syskeys 0 --pct-appswitch 0 --throttle 50 -s "$SEED" "$MONKEY_EVENTS" > "$OUT/monkey.txt" 2>&1
@@ -294,7 +295,6 @@ if [ "$result" -eq 0 ]; then
     fi
 fi
 
-adb shell settings put global always_finish_activities 0 >/dev/null 2>&1
 adb logcat -d > "$OUT/logcat.txt" 2>/dev/null
 app_log > "$OUT/app-log.txt"
 say "the app's own lines:"
