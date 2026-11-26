@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 - 2026-11-26
 
 The first build: a proof that axross-amp's player and its visualizations run
 as an Android app. Step 1 of two (see docs/ARCHITECTURE.md).
