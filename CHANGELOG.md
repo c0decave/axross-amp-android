@@ -17,8 +17,10 @@ as an Android app. Step 1 of two (see docs/ARCHITECTURE.md).
   Storage Access Framework's pickers; no permission asked for. content://
   documents are opened by descriptor and played in place, or copied to the
   cache where a provider does not allow that.
-- wgpu on Vulkan with OpenGL ES as the fallback (`debug.axrossamp.backend`
-  forces one); cpal on AAudio; symphonia with libopus.
+- wgpu on Vulkan (Android 10 and later with a GPU's Vulkan driver) or
+  OpenGL ES 3 (older Android, the emulator) - one of them, chosen at the
+  start (`debug.axrossamp.backend` forces one); cpal on AAudio; symphonia
+  with libopus.
 - Lifecycle: the surface given up and made anew when the app is hidden and
   shown; the music pauses when the app is hidden (no background playback
   yet), on the loss of audio focus and when headphones are pulled out.
