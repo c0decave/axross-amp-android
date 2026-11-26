@@ -121,10 +121,92 @@ impl Transport {
     }
 }
 
+/// How close to its end a wind (a long press, the seek bar) may take a
+/// track: it does not end the track (a skip past the end does).
+pub const WIND_END: f64 = 1.0;
+
+/// Where a seek goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SeekTo {
+    /// To this many seconds into the track.
+    At(f64),
+    /// On to the next track, as at the end of this one.
+    Next,
+    /// Nowhere (not a number).
+    Nowhere,
+}
+
+/// A seek to `secs` in a track `duration` seconds long (None: not known
+/// yet): from 0:00 at the least. At or past the end, `past_end` decides:
+/// [`SeekTo::Next`] for a skip, or [`WIND_END`] before the end for a wind
+/// and the seek bar (with no length known, a wind is not held back).
+pub fn seek_to(secs: f64, duration: Option<f64>, past_end: PastEnd) -> SeekTo {
+    if !secs.is_finite() {
+        return SeekTo::Nowhere;
+    }
+    let secs = secs.max(0.0);
+    match duration.filter(|d| d.is_finite() && *d > 0.0) {
+        Some(duration) if secs >= duration => match past_end {
+            PastEnd::Next => SeekTo::Next,
+            PastEnd::Stay => SeekTo::At((duration - WIND_END).max(0.0)),
+        },
+        Some(duration) if past_end == PastEnd::Stay => {
+            SeekTo::At(secs.min((duration - WIND_END).max(0.0)))
+        }
+        _ => SeekTo::At(secs),
+    }
+}
+
+/// What a seek at or past the end of a track does (see [`seek_to`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PastEnd {
+    Next,
+    Stay,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossbeam_channel::Receiver;
+
+    #[test]
+    fn a_seek_before_the_start_is_the_start() {
+        assert_eq!(seek_to(-15.0, Some(200.0), PastEnd::Next), SeekTo::At(0.0));
+        assert_eq!(seek_to(-3.0, None, PastEnd::Stay), SeekTo::At(0.0));
+        assert_eq!(seek_to(42.5, Some(200.0), PastEnd::Next), SeekTo::At(42.5));
+    }
+
+    #[test]
+    fn a_skip_past_the_end_is_the_next_track_a_wind_stops_before_it() {
+        assert_eq!(seek_to(205.0, Some(200.0), PastEnd::Next), SeekTo::Next);
+        assert_eq!(seek_to(200.0, Some(200.0), PastEnd::Next), SeekTo::Next);
+        assert_eq!(
+            seek_to(205.0, Some(200.0), PastEnd::Stay),
+            SeekTo::At(199.0)
+        );
+        assert_eq!(
+            seek_to(199.5, Some(200.0), PastEnd::Stay),
+            SeekTo::At(199.0)
+        );
+        // (a track shorter than the margin)
+        assert_eq!(seek_to(3.0, Some(0.5), PastEnd::Stay), SeekTo::At(0.0));
+    }
+
+    #[test]
+    fn without_a_length_only_the_start_holds_a_seek_back() {
+        // (still opening, or a length nobody knows)
+        assert_eq!(seek_to(500.0, None, PastEnd::Next), SeekTo::At(500.0));
+        assert_eq!(
+            seek_to(500.0, Some(f64::NAN), PastEnd::Stay),
+            SeekTo::At(500.0)
+        );
+        assert_eq!(seek_to(500.0, Some(0.0), PastEnd::Next), SeekTo::At(500.0));
+        assert_eq!(
+            seek_to(f64::NAN, Some(200.0), PastEnd::Next),
+            SeekTo::Nowhere
+        );
+        assert_eq!(seek_to(f64::INFINITY, None, PastEnd::Next), SeekTo::Nowhere);
+    }
 
     fn transport() -> (Transport, Receiver<Command>) {
         let (tx, rx) = crossbeam_channel::unbounded();

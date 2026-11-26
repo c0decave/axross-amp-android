@@ -35,10 +35,14 @@ the first builds happen in this repository's CI.
   GPU's Vulkan driver) or OpenGL ES 3 (older Android, the emulator), the
   pixel faces by shaders where the GPU does that faster than the CPU.
 - **Touch**: swipe left / right for the next / previous face; tap to show or
-  hide the controls; the controls leave by themselves after a few seconds
-  of music. The list of faces opens from "Faces".
-- **Controls**: title and artist, a seek bar, previous / play-pause / next,
-  "Folder" and "Files". Every target is at least 48 dp.
+  hide the controls (on the picture's outer thirds the tap waits 0.3 s for
+  a second one); double tap on the left / right third for 10 s back / on
+  (more taps skip on); the controls leave by themselves after a few
+  seconds of music. The list of faces opens from "Faces".
+- **Controls**: title and artist, a seek bar (heard while it is dragged, a
+  tap jumps there), previous / 15 s back / play-pause / 15 s on / next -
+  hold previous or next to wind, faster the longer - "Folder" and
+  "Files". Every target is at least 48 dp.
 - **Rotation, cutouts, system bars**: one layout for portrait and landscape,
   drawn edge to edge, the controls kept inside the safe insets.
 - **The screen stays on** while music plays.

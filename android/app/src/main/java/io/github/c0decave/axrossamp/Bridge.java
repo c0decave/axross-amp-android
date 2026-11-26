@@ -17,6 +17,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.util.Log;
@@ -28,6 +29,8 @@ import android.view.WindowManager;
 
 import java.util.ArrayDeque;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * What the Rust side cannot do through the NDK: the Storage Access
@@ -58,6 +61,8 @@ final class Bridge {
     static final int EVENT_NOISY = 5;
     /** Reserved for step 2 (MediaSession callbacks): a = the command. */
     static final int EVENT_MEDIA = 6;
+    /** The main thread has been blocked a = that many ms (the watchdog). */
+    static final int EVENT_STALL = 7;
 
     private static final int REQUEST_FOLDER = 4201;
     private static final int REQUEST_FILES = 4202;
@@ -65,6 +70,23 @@ final class Bridge {
     /** A folder's tracks: no more than this many, no deeper than this. */
     private static final int MAX_TRACKS = 5000;
     private static final int MAX_DEPTH = 12;
+
+    /**
+     * A folder's tracks go to the Rust side in batches while it is read, so
+     * that the first plays at once: the first batch at this many tracks (or
+     * sooner, see BATCH_MS), the others at BATCH_MORE.
+     */
+    private static final int BATCH_FIRST = 25;
+    private static final int BATCH_MORE = 250;
+    private static final long BATCH_MS = 300;
+    /** A folder whose listing takes longer than this is logged. */
+    private static final long SLOW_QUERY_MS = 1000;
+    /** The main thread blocked longer than this is logged (the watchdog). */
+    private static final long STALL_MS = 2000;
+
+    /** Counts the picks: a newer one ends the reading of an older one. */
+    private final AtomicInteger picks = new AtomicInteger();
+    private final boolean debuggable;
 
     private static native void nativeEvent(int kind, int a, int b, int c, int d, String text);
 
@@ -95,6 +117,83 @@ final class Bridge {
 
     Bridge(Activity activity) {
         this.activity = activity;
+        this.debuggable = (activity.getApplicationInfo().flags
+                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+    }
+
+    /** A file's name for the log: only a debug build logs names. */
+    private String logName(String name) {
+        if (debuggable) {
+            return name;
+        }
+        int dot = name == null ? -1 : name.lastIndexOf('.');
+        return dot < 0 ? "a file" : "a " + name.substring(dot) + " file";
+    }
+
+    // -- the watchdog -------------------------------------------------------------------------
+
+    private volatile long beat = SystemClock.uptimeMillis();
+    private volatile boolean watching;
+
+    /**
+     * Twice a second the main thread is asked to beat; when it has not for
+     * STALL_MS, what it and the app's threads are doing goes to the log -
+     * Java's stacks here, the Rust side's steps through EVENT_STALL - once
+     * a stall, and its end when it ends.
+     */
+    void startWatchdog() {
+        if (watching) {
+            return;
+        }
+        watching = true;
+        Handler main = new Handler(Looper.getMainLooper());
+        Thread dog = new Thread(() -> {
+            boolean told = false;
+            while (watching) {
+                main.post(() -> beat = SystemClock.uptimeMillis());
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                long blocked = SystemClock.uptimeMillis() - beat;
+                if (blocked > STALL_MS && !told) {
+                    told = true;
+                    logStall(blocked);
+                } else if (blocked <= 600 && told) {
+                    told = false;
+                    Log.w(TAG, "the main thread goes on again");
+                }
+            }
+        }, "amp-watchdog");
+        dog.setDaemon(true);
+        dog.start();
+    }
+
+    void stopWatchdog() {
+        watching = false;
+    }
+
+    private void logStall(long blocked) {
+        Log.w(TAG, "the main thread has been blocked for " + blocked + " ms; its stack:");
+        Thread main = Looper.getMainLooper().getThread();
+        logStack(main, main.getStackTrace());
+        for (Map.Entry<Thread, StackTraceElement[]> entry : Thread.getAllStackTraces().entrySet()) {
+            Thread thread = entry.getKey();
+            if (thread != main && thread.getName().startsWith("amp")) {
+                logStack(thread, entry.getValue());
+            }
+        }
+        event(EVENT_STALL, (int) Math.min(blocked, Integer.MAX_VALUE), 0, 0, 0, null);
+    }
+
+    private static void logStack(Thread thread, StackTraceElement[] stack) {
+        StringBuilder text = new StringBuilder();
+        text.append(thread.getName()).append(" (").append(thread.getState()).append(')');
+        for (int i = 0; i < stack.length && i < 24; i++) {
+            text.append("\n    at ").append(stack[i]);
+        }
+        Log.w(TAG, text.toString());
     }
 
     // -- the window ---------------------------------------------------------------------------
@@ -210,7 +309,7 @@ final class Bridge {
         } catch (RuntimeException e) {
             // (no documents app on this device)
             Log.e(TAG, "no picker", e);
-            event(EVENT_PICKED, -1, 0, 0, 0, "");
+            event(EVENT_PICKED, -1, 0, picks.incrementAndGet(), 0, "");
         }
     }
 
@@ -218,12 +317,17 @@ final class Bridge {
         if (uri == null) {
             return -1;
         }
+        long asked = SystemClock.uptimeMillis();
         try {
             ParcelFileDescriptor pfd =
                     activity.getContentResolver().openFileDescriptor(Uri.parse(uri), "r");
+            long took = SystemClock.uptimeMillis() - asked;
+            if (took > SLOW_QUERY_MS) {
+                Log.w(TAG, "the provider took " + took + " ms to open a document");
+            }
             return pfd == null ? -1 : pfd.detachFd();
         } catch (Exception e) {
-            Log.w(TAG, "cannot open " + uri + ": " + e);
+            Log.w(TAG, "cannot open " + (debuggable ? uri : "a document") + ": " + e);
             return -1;
         }
     }
@@ -234,27 +338,82 @@ final class Bridge {
         if (request != REQUEST_FOLDER && request != REQUEST_FILES) {
             return;
         }
+        int pick = picks.incrementAndGet();
         if (result != Activity.RESULT_OK || data == null) {
-            // (a = 0: nothing chosen)
-            event(EVENT_PICKED, 0, 0, 0, 0, "");
+            // (nothing chosen: an empty last batch)
+            event(EVENT_PICKED, 0, 0, pick, 0, "");
             return;
         }
-        // (a folder is read off the main thread: it may hold thousands)
+        // (a folder is read off the main thread: it may hold thousands, and
+        // a busy provider answers slowly)
         Thread reader = new Thread(() -> {
-            StringBuilder out = new StringBuilder();
-            int count = 0;
+            Batches batches = new Batches(pick);
+            long started = SystemClock.uptimeMillis();
+            Log.i(TAG, "pick " + pick + ": reading " + (request == REQUEST_FOLDER ? "a folder" : "the files"));
             try {
                 if (request == REQUEST_FOLDER) {
-                    count = listTree(data.getData(), out);
+                    listTree(data.getData(), batches);
                 } else {
-                    count = listFiles(data, out);
+                    listFiles(data, batches);
                 }
             } catch (RuntimeException e) {
                 Log.e(TAG, "reading the choice failed", e);
             }
-            event(EVENT_PICKED, count, 0, 0, 0, out.toString());
+            batches.last();
+            Log.i(TAG, "pick " + pick + ": " + batches.total + " tracks in "
+                    + (SystemClock.uptimeMillis() - started) + " ms"
+                    + (batches.current() ? "" : " (a newer pick came)"));
         }, "amp-picked");
         reader.start();
+    }
+
+    /**
+     * The tracks of one pick, to the Rust side in batches: EVENT_PICKED with
+     * a = the batch's tracks, b = 1 while more follow (0: the last), c = the
+     * pick, d = the tracks so far.
+     */
+    private final class Batches {
+        final int pick;
+        final StringBuilder out = new StringBuilder();
+        int inBatch;
+        int total;
+        int sent;
+        long since = SystemClock.uptimeMillis();
+
+        Batches(int pick) {
+            this.pick = pick;
+        }
+
+        /** Whether this pick is still the latest. */
+        boolean current() {
+            return picks.get() == pick;
+        }
+
+        void add(Uri uri, String folder, String name) {
+            line(out, uri, folder, name);
+            inBatch++;
+            total++;
+            int size = sent == 0 ? BATCH_FIRST : BATCH_MORE;
+            if (inBatch >= size || SystemClock.uptimeMillis() - since >= BATCH_MS) {
+                send(true);
+            }
+        }
+
+        void send(boolean more) {
+            if (!current()) {
+                return;
+            }
+            event(EVENT_PICKED, inBatch, more ? 1 : 0, pick, total, out.toString());
+            Log.i(TAG, "pick " + pick + ": " + total + " tracks so far" + (more ? "" : ", done"));
+            out.setLength(0);
+            inBatch = 0;
+            sent++;
+            since = SystemClock.uptimeMillis();
+        }
+
+        void last() {
+            send(false);
+        }
     }
 
     /** One line a track: uri, tab, folder ("" at the top), tab, name. */
@@ -267,22 +426,18 @@ final class Bridge {
         return text == null ? "" : text.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
     }
 
-    private int listFiles(Intent data, StringBuilder out) {
-        int count = 0;
+    private void listFiles(Intent data, Batches batches) {
         ClipData clip = data.getClipData();
         if (clip != null) {
-            for (int i = 0; i < clip.getItemCount() && count < MAX_TRACKS; i++) {
+            for (int i = 0; i < clip.getItemCount() && batches.total < MAX_TRACKS; i++) {
                 Uri uri = clip.getItemAt(i).getUri();
-                if (uri != null) {
-                    line(out, uri, "", displayName(uri));
-                    count++;
+                if (uri != null && batches.current()) {
+                    batches.add(uri, "", displayName(uri));
                 }
             }
         } else if (data.getData() != null) {
-            line(out, data.getData(), "", displayName(data.getData()));
-            count++;
+            batches.add(data.getData(), "", displayName(data.getData()));
         }
-        return count;
     }
 
     private String displayName(Uri uri) {
@@ -299,9 +454,9 @@ final class Bridge {
     }
 
     /** Every audio document below the tree, breadth first. */
-    private int listTree(Uri tree, StringBuilder out) {
+    private void listTree(Uri tree, Batches batches) {
         if (tree == null) {
-            return 0;
+            return;
         }
         ContentResolver resolver = activity.getContentResolver();
         String[] columns = {
@@ -312,13 +467,20 @@ final class Bridge {
         ArrayDeque<String[]> folders = new ArrayDeque<>();
         // (document id, the folder's path below the tree, depth)
         folders.add(new String[] {DocumentsContract.getTreeDocumentId(tree), "", "0"});
-        int count = 0;
-        while (!folders.isEmpty() && count < MAX_TRACKS) {
+        while (!folders.isEmpty() && batches.total < MAX_TRACKS && batches.current()) {
             String[] folder = folders.poll();
             int depth = Integer.parseInt(folder[2]);
             Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, folder[0]);
+            long asked = SystemClock.uptimeMillis();
             try (Cursor cursor = resolver.query(children, columns, null, null, null)) {
-                while (cursor != null && cursor.moveToNext() && count < MAX_TRACKS) {
+                long took = SystemClock.uptimeMillis() - asked;
+                if (took > SLOW_QUERY_MS) {
+                    Log.w(TAG, "a folder's listing took " + took + " ms (a busy provider)");
+                }
+                while (cursor != null && cursor.moveToNext() && batches.total < MAX_TRACKS) {
+                    if (!batches.current()) {
+                        return;
+                    }
                     String id = cursor.getString(0);
                     String name = cursor.isNull(1) ? "" : cursor.getString(1);
                     String mime = cursor.isNull(2) ? "" : cursor.getString(2);
@@ -328,16 +490,14 @@ final class Bridge {
                             folders.add(new String[] {id, path, String.valueOf(depth + 1)});
                         }
                     } else if (isAudio(mime, name)) {
-                        line(out, DocumentsContract.buildDocumentUriUsingTree(tree, id),
+                        batches.add(DocumentsContract.buildDocumentUriUsingTree(tree, id),
                                 folder[1], name);
-                        count++;
                     }
                 }
             } catch (RuntimeException e) {
-                Log.w(TAG, "cannot list " + children + ": " + e);
+                Log.w(TAG, "cannot list a folder (" + logName(folder[1]) + "): " + e);
             }
         }
-        return count;
     }
 
     /** By MIME type, and by the name's ending where a provider knows none. */

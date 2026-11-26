@@ -1,7 +1,9 @@
 //! The one screen: a face over the whole display, and over it - shown and
-//! hidden by a tap - the track's title, a seek bar, previous / play / next,
-//! the pickers and the list of faces. A swipe to the side steps through the
-//! faces.
+//! hidden by a tap - the track's title, a seek bar, previous / 15 s back /
+//! play / 15 s on / next, the pickers and the list of faces. A swipe to the
+//! side steps through the faces; a double tap on the picture's left or
+//! right third skips 10 s; a long press on previous or next winds (see
+//! [`crate::gesture`]).
 //!
 //! Everything a finger can hit is at least 48 points (dp) in both
 //! directions, and nothing to hit or read lies under a system bar or a
@@ -16,9 +18,10 @@ use crate::amp::engine::{self, Art};
 use crate::amp::meters::Meters;
 use crate::amp::state::VisualOptions;
 use crate::amp::viz::{self, VizState};
-use crate::gesture::{self, Step};
+use crate::gesture::{self, Step, TapAction, Taps};
 use crate::platform::{self, Event};
 use crate::player::Player;
+use crate::watch;
 use eframe::egui;
 use egui::{
     Align2, Color32, FontId, Id, Pos2, Rect, RichText, Sense, Stroke, Ui, UiBuilder, Vec2, pos2,
@@ -37,6 +40,13 @@ const BUTTON: f32 = 64.0;
 const _: () = assert!(TOUCH >= 48.0 && BUTTON >= TOUCH);
 /// Seconds the controls stay after the last touch while music plays.
 const CONTROLS_STAY: f64 = 6.0;
+/// What the buttons beside play skip, in seconds (the desktop's 15).
+const BUTTON_SKIP: f64 = 15.0;
+/// How often a wind or a drag of the seek bar is heard (seconds between
+/// the seeks it sends).
+const SCRUB_EVERY: f64 = 0.3;
+/// How long a double tap's "+10 s" stays on the picture.
+const HINT_STAYS: f64 = 0.7;
 /// The face shown first.
 const FIRST_FACE: &str = "spectrum";
 /// The loudness meter's target (LUFS), the desktop's default.
@@ -75,8 +85,22 @@ pub struct Screen {
     drag_from: Option<Pos2>,
     /// Where the finger was last seen during the drag.
     drag_to: Option<Pos2>,
-    /// The seek bar's knob while a finger holds it (0..1).
+    /// The seek bar's knob while a finger holds it (0..1), and when the
+    /// sound followed it last.
     seeking: Option<f32>,
+    scrubbed: f64,
+    /// Taps on the picture: single (the controls) or double (a skip).
+    taps: Taps,
+    /// A double tap's skip, shown on its side a moment: the seconds so far,
+    /// the side (true: right), until when.
+    hint: Option<(f64, bool, f64)>,
+    /// A long press on previous or next winding: back (-1) or on (1), from
+    /// where, to where now, and when the sound followed last.
+    winding: Option<Wind>,
+    /// That press wound: its release is no click on the button.
+    wound: Option<f64>,
+    /// The pick the batches come from (a newer pick: a new list).
+    pick: i32,
     picking: bool,
     /// A line of the screen's own (the picker's answer).
     note: String,
@@ -161,6 +185,12 @@ impl Screen {
             drag_from: None,
             drag_to: None,
             seeking: None,
+            scrubbed: 0.0,
+            taps: Taps::default(),
+            hint: None,
+            winding: None,
+            wound: None,
+            pick: 0,
             picking: false,
             note: String::new(),
             screen_kept_on: false,
@@ -177,17 +207,41 @@ impl Screen {
         for event in platform::poll() {
             match event {
                 Event::Insets(insets) => self.insets = insets,
-                Event::Picked(tracks) => {
+                Event::Picked {
+                    tracks,
+                    pick,
+                    more,
+                    total,
+                } => {
+                    // (a batch of an older pick: of no use any more)
+                    if pick < self.pick {
+                        continue;
+                    }
+                    let first = pick != self.pick;
+                    self.pick = pick;
                     self.picking = false;
-                    if tracks.is_empty() {
-                        self.note = "Nothing to play was chosen.".into();
-                    } else {
+                    if first && tracks.is_empty() && !more {
+                        self.note = if total == 0 {
+                            "Nothing to play was chosen.".into()
+                        } else {
+                            String::new()
+                        };
+                    } else if first {
                         self.note.clear();
                         let play = platform::request_audio_focus();
                         self.player.set_picked(tracks, play);
                         // (the controls stay a moment over the new music)
                         self.touched = ctx.input(|i| i.time);
                         self.controls = true;
+                    } else if !tracks.is_empty() {
+                        let play = self.player.transport.wants_playing();
+                        self.player.add_picked(tracks, play);
+                    }
+                    if !more {
+                        platform::log_line(&format!(
+                            "pick {pick}: {} tracks in the list",
+                            self.player.playlist.tracks.len()
+                        ));
                     }
                 }
                 Event::NoPicker => {
@@ -222,6 +276,8 @@ impl Screen {
             platform::MEDIA_TOGGLE => self.toggle(),
             platform::MEDIA_NEXT => self.player.next(false),
             platform::MEDIA_PREVIOUS => self.player.previous(),
+            platform::MEDIA_FORWARD => self.player.skip(BUTTON_SKIP),
+            platform::MEDIA_REWIND => self.player.skip(-BUTTON_SKIP),
             _ => {}
         }
     }
@@ -434,11 +490,12 @@ impl Screen {
         // the seek bar between the time gone and the track's length
         let row = Rect::from_min_size(pos2(inner.min.x, line.max.y), vec2(inner.width(), TOUCH));
         let duration = self.player.duration.unwrap_or(0.0).max(0.0);
-        let position = self.player.position().clamp(0.0, duration.max(0.0));
+        let position = self.player.shown_position().clamp(0.0, duration.max(0.0));
         let can_seek = self.player.ready() && self.player.info.seekable && duration > 0.0;
-        let shown = match self.seeking {
-            Some(at) => at as f64 * duration,
-            None => position,
+        let shown = match (self.seeking, &self.winding) {
+            (Some(at), _) => at as f64 * duration,
+            (None, Some(wind)) => wind.to.clamp(0.0, duration.max(0.0)),
+            (None, None) => position,
         };
         let clock = 52.0;
         let font = FontId::monospace(13.0);
@@ -465,52 +522,165 @@ impl Screen {
             pos2(row.max.x - clock, row.max.y),
         );
         let fraction = if duration > 0.0 {
-            (position / duration) as f32
+            (shown / duration) as f32
         } else {
             0.0
         };
         let (now_at, released) = seek_bar(ui, bar, self.seeking.unwrap_or(fraction), can_seek);
+        let now = ui.input(|i| i.time);
         if can_seek {
             if let Some(at) = now_at {
+                // (dragged: the sound follows the knob now and then - a
+                // scrub - and the clock shows where it is)
+                if self.seeking.is_none() {
+                    self.scrubbed = now;
+                }
                 self.seeking = Some(at);
+                if now - self.scrubbed >= SCRUB_EVERY {
+                    self.scrubbed = now;
+                    self.player.wind_to(at as f64 * duration);
+                }
             }
             // (let go: as the bar says, or - a long press that was neither a
             // tap nor a drag - simply no finger down any more)
             let let_go = released || !ui.input(|i| i.pointer.any_down());
             if let_go && let Some(at) = self.seeking.take() {
-                self.player.seek(at as f64 * duration);
+                self.player.wind_to(at as f64 * duration);
             }
         } else {
             self.seeking = None;
         }
 
-        // previous, play or pause, next
+        // previous, 15 s back, play or pause, 15 s on, next: five round
+        // buttons, as large as the width lets them be (never under 48)
         let centre = pos2(inner.center().x, row.max.y + 4.0 + BUTTON / 2.0);
-        let gap = BUTTON + 24.0;
+        let size = ((inner.width() - 4.0 * 8.0) / 5.0).clamp(TOUCH, BUTTON);
+        let step = size + ((inner.width() - 5.0 * size) / 4.0).clamp(8.0, 24.0);
         let enabled = self.player.has_tracks();
-        let square = |x: f32| Rect::from_center_size(pos2(x, centre.y), Vec2::splat(BUTTON));
-        if icon_button(
-            ui,
-            square(centre.x - gap),
-            "previous",
-            Icon::Previous,
-            enabled,
-        )
-        .clicked()
-        {
+        let at =
+            |k: f32| Rect::from_center_size(pos2(centre.x + k * step, centre.y), Vec2::splat(size));
+        let previous = icon_button(ui, at(-2.0), "previous", Icon::Previous, enabled);
+        if self.hold(ui, &previous, -1.0, now) {
             self.player.previous();
+        }
+        if icon_button(ui, at(-1.0), "back", Icon::Back, enabled).clicked() {
+            self.player.skip(-BUTTON_SKIP);
         }
         let icon = if self.player.transport.wants_playing() {
             Icon::Pause
         } else {
             Icon::Play
         };
-        if icon_button(ui, square(centre.x), "play", icon, enabled).clicked() {
+        if icon_button(ui, at(0.0), "play", icon, enabled).clicked() {
             self.toggle();
         }
-        if icon_button(ui, square(centre.x + gap), "next", Icon::Next, enabled).clicked() {
+        if icon_button(ui, at(1.0), "on", Icon::On, enabled).clicked() {
+            self.player.skip(BUTTON_SKIP);
+        }
+        let next = icon_button(ui, at(2.0), "next", Icon::Next, enabled);
+        if self.hold(ui, &next, 1.0, now) {
             self.player.next(false);
         }
+    }
+
+    /// Previous or next (`direction` -1 or 1) under a finger: a long press
+    /// winds back or on while it is held, faster the longer
+    /// ([`gesture::wind_speed`]); true: it was a tap (the button's own
+    /// step).
+    fn hold(&mut self, ui: &Ui, button: &egui::Response, direction: f64, now: f64) -> bool {
+        let down = button.is_pointer_button_down_on();
+        if down {
+            let pressed = ui.input(|i| i.pointer.press_start_time()).unwrap_or(now);
+            let held = now - pressed;
+            if gesture::wind_speed(held) > 0.0 && self.player.has_tracks() {
+                if self
+                    .winding
+                    .as_ref()
+                    .is_none_or(|w| w.direction != direction)
+                {
+                    self.winding = Some(Wind {
+                        direction,
+                        from: self.player.shown_position(),
+                        to: self.player.shown_position(),
+                        heard: now,
+                    });
+                    self.wound = Some(direction);
+                }
+                if let Some(wind) = self.winding.as_mut() {
+                    wind.to = wind.from + direction * gesture::wound(held);
+                    if now - wind.heard >= SCRUB_EVERY {
+                        wind.heard = now;
+                        let to = wind.to;
+                        self.player.wind_to(to);
+                    }
+                }
+                ui.ctx().request_repaint();
+            }
+        } else if let Some(wind) = self.winding.take_if(|w| w.direction == direction) {
+            // (let go: where it was wound to)
+            self.player.wind_to(wind.to);
+        }
+        if button.clicked() {
+            // (the release of a press that wound is no step)
+            return self.wound.take() != Some(direction);
+        }
+        if !down
+            && !button.is_pointer_button_down_on()
+            && self.winding.is_none()
+            && !ui.input(|i| i.pointer.any_down())
+        {
+            self.wound = None;
+        }
+        false
+    }
+
+    /// A double tap's skip: done, and shown on its side a moment (a chain
+    /// of them adds up).
+    fn skip_by_tap(&mut self, secs: f64, now: f64) {
+        if !self.player.has_tracks() {
+            return;
+        }
+        self.player.skip(secs);
+        let right = secs > 0.0;
+        let total = match self.hint {
+            Some((so_far, side, until)) if side == right && now <= until => so_far + secs,
+            _ => secs,
+        };
+        self.hint = Some((total, right, now + HINT_STAYS));
+    }
+
+    /// The double tap's "+10 s" over its side of the picture.
+    fn draw_hint(&mut self, ui: &Ui, screen: Rect, now: f64) {
+        let Some((secs, right, until)) = self.hint else {
+            return;
+        };
+        if now > until {
+            self.hint = None;
+            return;
+        }
+        // (fading in its last third; never a flash: soft, small, grey on
+        // the dark picture, and the flash guard is over the faces anyway)
+        let left = ((until - now) / (HINT_STAYS / 3.0)).min(1.0) as f32;
+        let x = if right {
+            screen.max.x - screen.width() / 6.0
+        } else {
+            screen.min.x + screen.width() / 6.0
+        };
+        let centre = pos2(x, screen.center().y);
+        let painter = ui.painter();
+        painter.circle_filled(
+            centre,
+            44.0,
+            Color32::from_rgba_unmultiplied(12, 16, 20, (150.0 * left) as u8),
+        );
+        painter.text(
+            centre,
+            Align2::CENTER_CENTER,
+            format!("{}{:.0} s", if secs > 0.0 { "+" } else { "−" }, secs.abs()),
+            FontId::proportional(18.0),
+            Color32::from_rgba_unmultiplied(0xec, 0xf0, 0xf1, (230.0 * left) as u8),
+        );
+        ui.ctx().request_repaint();
     }
 
     /// The list of faces, group by group; a tap chooses one and closes it.
@@ -559,10 +729,20 @@ impl Screen {
 
 impl eframe::App for Screen {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        watch::doing("amp-window", "reading the news");
         self.pump(ctx);
+        watch::done("amp-window");
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        watch::doing("amp-window", "drawing a frame");
+        self.frame(ui);
+        watch::done("amp-window");
+    }
+}
+
+impl Screen {
+    fn frame(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let (screen, now, touching) = ui.input(|i| {
             (
@@ -619,10 +799,29 @@ impl eframe::App for Screen {
                     None => {}
                 }
             }
-            if picture.clicked() {
-                self.controls = !self.controls;
+            // a tap: the controls (at once in the middle third, a moment
+            // later on the sides), a double tap on a side: a skip
+            let mut actions = Vec::new();
+            if picture.clicked()
+                && let Some(at) = picture.interact_pointer_pos()
+            {
+                actions.extend(
+                    self.taps
+                        .tap(now, at.x - screen.min.x, at.y, screen.width()),
+                );
+            }
+            actions.extend(self.taps.tick(now));
+            for action in actions {
+                match action {
+                    TapAction::Controls => self.controls = !self.controls,
+                    TapAction::Skip(secs) => self.skip_by_tap(secs, now),
+                }
+            }
+            if self.taps.waiting() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
+        self.draw_hint(ui, screen, now);
 
         // the controls leave by themselves while music plays - never while
         // there is nothing to play yet, a finger is on them or the list is open
@@ -630,6 +829,7 @@ impl eframe::App for Screen {
             && self.player.playing()
             && !self.faces_open
             && self.seeking.is_none()
+            && self.winding.is_none()
             && now - self.touched > CONTROLS_STAY
         {
             self.controls = false;
@@ -761,12 +961,23 @@ fn text_button(ui: &mut Ui, rect: Rect, id: &str, label: &str, on: bool) -> egui
     response
 }
 
+/// A long press winding (see [`Screen::hold`]).
+struct Wind {
+    direction: f64,
+    from: f64,
+    to: f64,
+    heard: f64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Icon {
     Play,
     Pause,
     Previous,
     Next,
+    /// 15 s back, 15 s on.
+    Back,
+    On,
 }
 
 impl Icon {
@@ -774,8 +985,10 @@ impl Icon {
         match self {
             Icon::Play => "Play",
             Icon::Pause => "Pause",
-            Icon::Previous => "Previous track",
-            Icon::Next => "Next track",
+            Icon::Previous => "Previous track (hold: wind back)",
+            Icon::Next => "Next track (hold: wind on)",
+            Icon::Back => "15 seconds back",
+            Icon::On => "15 seconds on",
         }
     }
 }
@@ -835,6 +1048,41 @@ fn icon_button(ui: &mut Ui, rect: Rect, id: &str, icon: Icon, enabled: bool) -> 
         Icon::Previous => {
             painter.add(triangle(centre.x - 6.0, centre.x + 9.0, 10.0));
             painter.rect_filled(bar(centre.x - 10.0, 4.0, 10.0), 1.0, ink);
+        }
+        Icon::Back | Icon::On => {
+            // (a ring with an arrowhead, and the seconds in it)
+            let back = icon == Icon::Back;
+            let r = (radius - 9.0).max(10.0);
+            let (from, to) = if back {
+                (-0.6f32, 4.1f32)
+            } else {
+                (-2.54f32, 2.17f32)
+            };
+            let points: Vec<Pos2> = (0..=20)
+                .map(|i| {
+                    let a = from + (to - from) * i as f32 / 20.0;
+                    pos2(centre.x + r * a.cos(), centre.y + r * a.sin())
+                })
+                .collect();
+            let head = points[0];
+            painter.add(egui::Shape::line(points, Stroke::new(2.0, ink)));
+            let dx = if back { 5.0 } else { -5.0 };
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    pos2(head.x + dx, head.y - 4.0),
+                    pos2(head.x - dx * 0.2, head.y - 7.0),
+                    pos2(head.x - dx * 0.2, head.y + 1.0),
+                ],
+                ink,
+                Stroke::NONE,
+            ));
+            painter.text(
+                centre,
+                Align2::CENTER_CENTER,
+                "15",
+                FontId::proportional(13.0),
+                ink,
+            );
         }
     }
     response

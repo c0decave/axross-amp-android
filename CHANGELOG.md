@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.1 (unreleased)
+
+- A folder picked while music is still being copied into it no longer
+  holds the app up. The folder's tracks come in batches while it is read
+  (the first plays at once, the list fills behind it; a newer pick ends
+  the reading of an older one); every document is opened off the
+  window's thread with a time limit, and a newer request sets aside an
+  opening the system does not answer; a track still being written (empty,
+  changed in the last 5 s, or growing between two looks) is passed over
+  and tried again later; a copy where a document cannot be opened in
+  place stops at 1 GiB or 60 s.
+- Seeking: 15 s back and on beside play; a long press on previous or next
+  winds back or on, faster the longer it is held; a double tap on the
+  picture's left or right third skips 10 s (more taps skip on), with a
+  hint on the picture; the seek bar is heard while it is dragged, a tap on
+  it jumps there; a seek asked for while a track is still opening is done
+  once it is open; past the end a skip goes on to the next track.
+- Step logs and watchdogs: each step of a pick and of opening a track is
+  logged with its time (file names only in debug builds); a step taking
+  longer than 2 s is logged while it waits, and a main thread blocked for
+  2 s logs the Java stacks and the Rust side's steps.
+- New launcher icon: the Synthwave Sun, with a themed-icon layer for
+  Android 13+.
+
 ## 0.1.0 - 2026-11-26
 
 The first build: a proof that axross-amp's player and its visualizations run

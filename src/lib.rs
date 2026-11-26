@@ -30,6 +30,10 @@ pub mod player;
 pub mod screen;
 pub mod source;
 pub mod transport;
+pub mod watch;
+
+#[cfg(all(test, target_os = "linux"))]
+mod stall_tests;
 
 /// The activity's entry point (the android-activity glue calls it on a
 /// thread of its own once the activity is created).
@@ -41,6 +45,7 @@ fn android_main(app: android_activity::AndroidApp) {
 
     platform::android::init_logging();
     platform::android::init(&app);
+    watch::start();
     platform::log_line(concat!(
         "axross-amp-android ",
         env!("CARGO_PKG_VERSION"),

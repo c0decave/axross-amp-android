@@ -40,6 +40,9 @@ pub const EVENT_NOISY: i32 = 5;
 /// Reserved for step 2: a MediaSession's callbacks (lock screen, headset,
 /// notification) - `a` is one of the `MEDIA_*` commands.
 pub const EVENT_MEDIA: i32 = 6;
+/// The Java side's watchdog: the main thread has been blocked `a` ms (the
+/// Rust side's steps go to the log at once).
+pub const EVENT_STALL: i32 = 7;
 
 pub const MEDIA_PLAY: i32 = 1;
 pub const MEDIA_PAUSE: i32 = 2;
@@ -47,6 +50,10 @@ pub const MEDIA_TOGGLE: i32 = 3;
 pub const MEDIA_NEXT: i32 = 4;
 pub const MEDIA_PREVIOUS: i32 = 5;
 pub const MEDIA_STOP: i32 = 6;
+/// Fast forward and rewind (a headset's, the lock screen's: step 2's
+/// MediaSession) - the same skips as the buttons.
+pub const MEDIA_FORWARD: i32 = 7;
+pub const MEDIA_REWIND: i32 = 8;
 
 // android.media.AudioManager's AUDIOFOCUS_* values
 const FOCUS_GAIN: i32 = 1;
@@ -74,8 +81,17 @@ pub enum Interrupt {
 pub enum Event {
     /// The window's safe insets, in pixels: left, top, right, bottom.
     Insets([i32; 4]),
-    /// A picker's answer (empty: nothing chosen, or nothing playable in it).
-    Picked(Vec<Picked>),
+    /// A batch of a picker's answer: a folder's tracks come in batches
+    /// while it is read. `pick` counts the picks (a batch of an older one
+    /// is of no use), `more` says whether more batches follow, `total` how
+    /// many tracks there are so far (an empty last batch with none:
+    /// nothing chosen, or nothing playable in it).
+    Picked {
+        tracks: Vec<Picked>,
+        pick: i32,
+        more: bool,
+        total: i32,
+    },
     /// The device has no documents app to pick with.
     NoPicker,
     /// The activity is shown again or hidden.
@@ -130,7 +146,25 @@ pub fn dispatch(kind: i32, a: i32, b: i32, c: i32, d: i32, text: &str) {
             None,
         ),
         EVENT_PICKED if a < 0 => (Event::NoPicker, None),
-        EVENT_PICKED => (Event::Picked(picked::parse(text)), None),
+        EVENT_PICKED => (
+            Event::Picked {
+                tracks: picked::parse(text),
+                more: b != 0,
+                pick: c,
+                total: d,
+            },
+            None,
+        ),
+        EVENT_STALL => {
+            // (on the watchdog's thread, at once: the next frame may be the
+            // one that does not come)
+            let steps = crate::watch::report();
+            log_line(&format!(
+                "the main thread has been blocked for {a} ms; the app's own threads: {}",
+                if steps.is_empty() { "all idle" } else { &steps }
+            ));
+            return;
+        }
         EVENT_LIFECYCLE => (Event::Shown(a != 0), (a == 0).then_some(Interrupt::Hidden)),
         EVENT_AUDIO_FOCUS => {
             let what = match a {
@@ -221,9 +255,9 @@ mod tests {
         dispatch(
             EVENT_PICKED,
             2,
-            0,
-            0,
-            0,
+            1,
+            7,
+            2,
             "content://x/1\tA\tone.mp3\ncontent://x/2\tA\ttwo.mp3\n",
         );
         dispatch(EVENT_PICKED, -1, 0, 0, 0, "");
@@ -244,6 +278,8 @@ mod tests {
         dispatch(EVENT_AUDIO_FOCUS, 77, 0, 0, 0, "");
         dispatch(EVENT_NOISY, 0, 0, 0, 0, "");
         dispatch(EVENT_MEDIA, MEDIA_NEXT, 0, 0, 0, "");
+        // (logged at once, nothing queued)
+        dispatch(EVENT_STALL, 2500, 0, 0, 0, "");
         dispatch(999, 0, 0, 0, 0, "");
 
         // (told at once, before any frame)
@@ -261,9 +297,15 @@ mod tests {
         assert_eq!(woken.load(Ordering::Relaxed), events.len());
         assert_eq!(events[0], Event::Insets([0, 96, 0, 48]));
         match &events[1] {
-            Event::Picked(tracks) => {
+            Event::Picked {
+                tracks,
+                pick,
+                more,
+                total,
+            } => {
                 assert_eq!(tracks.len(), 2);
                 assert_eq!(tracks[1].name, "two.mp3");
+                assert_eq!((*pick, *more, *total), (7, true, 2));
             }
             other => panic!("{other:?}"),
         }

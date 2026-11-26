@@ -28,6 +28,7 @@ public final class MainActivity extends NativeActivity {
         bridge.edgeToEdge();
         super.onCreate(savedInstanceState);
         bridge.watchInsets();
+        bridge.startWatchdog();
     }
 
     /** Called from Rust (any thread): see Bridge.call. */
@@ -58,6 +59,7 @@ public final class MainActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
+        bridge.stopWatchdog();
         bridge.release();
         super.onDestroy();
     }

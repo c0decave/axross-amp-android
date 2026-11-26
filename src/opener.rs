@@ -11,22 +11,165 @@
 //!   descriptor is kept;
 //! - where the link cannot be opened (a provider whose descriptors cannot be
 //!   opened a second time: a pipe, some cloud storage) the document is copied
-//!   into the cache instead.
+//!   into the cache instead - at most [`COPY_BYTES`], within [`COPY_TIME`].
+//!
+//! The opening itself may wait on the system for long: a provider that is
+//! busy (a phone short of storage, its media scanner going through the
+//! files being copied in) answers in seconds, or not at all. So it runs on
+//! a thread of its own ([`Opener::begin`]) that the caller waits for no
+//! longer than it likes ([`Opening`]); one given up on cleans up after
+//! itself when it is done.
+//!
+//! A document still being written - copied in while it is picked - is not
+//! played half: empty, changed in the last [`RECENT`], or growing between
+//! two looks, it is "still being copied" ([`Failure::Copying`]) and the
+//! player tries it again later.
 //!
 //! Only the last few tracks stay open ([`KEEP`]): the one playing, the one
 //! queued behind it, the ones just left.
 
 use crate::picked;
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How many opened tracks are kept (their descriptors, links or copies).
 pub const KEEP: usize = 6;
 
+/// A file changed less than this long ago is still being written.
+pub const RECENT: Duration = Duration::from_secs(5);
+
+/// A file changed less than this long ago is looked at twice, this far
+/// apart: if it grew, it is still being written.
+pub const SETTLING: Duration = Duration::from_secs(60);
+pub const SECOND_LOOK: Duration = Duration::from_millis(300);
+
+/// How long the system may take to hand over a document.
+pub const OPEN_TIME: Duration = Duration::from_secs(12);
+
+/// A copy (where a document cannot be opened in place) ends here.
+pub const COPY_TIME: Duration = Duration::from_secs(60);
+pub const COPY_BYTES: u64 = 1 << 30;
+
 /// Whether `uri` is a document of a content provider (else: a path).
 pub fn is_document(uri: &str) -> bool {
     uri.starts_with("content://")
+}
+
+/// Why a document is not open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// Still being written (copied in): to be tried again later.
+    Copying(String),
+    /// It cannot be opened or read.
+    Failed(String),
+}
+
+impl Failure {
+    pub fn message(&self) -> &str {
+        match self {
+            Failure::Copying(m) | Failure::Failed(m) => m,
+        }
+    }
+}
+
+/// What a worker says about the document it opens.
+pub(crate) enum Said {
+    /// The document cannot be opened in place: it is being copied (the
+    /// caller gives it [`COPY_TIME`] more).
+    Copying,
+    Done(Result<Placed, Failure>),
+}
+
+pub(crate) struct Placed {
+    path: PathBuf,
+    /// The descriptor the link points at (None: a copy).
+    file: Option<File>,
+}
+
+/// A document being opened on a thread of its own.
+pub struct Opening {
+    pub uri: String,
+    said: Receiver<Said>,
+    /// When it is given up on (later once it copies).
+    pub deadline: Instant,
+    pub started: Instant,
+    /// Told that it is given up on: what it opened is let go of.
+    abandon: Option<Sender<()>>,
+}
+
+/// What an opening gave: the file's place in the cache and the descriptor
+/// its link points at (None: a copy), or why not.
+pub type Opened = Result<(PathBuf, Option<File>), Failure>;
+
+impl Opening {
+    /// The worker's messages, for a `select!`: each one goes to
+    /// [`Opening::handle`].
+    pub(crate) fn said(&self) -> &Receiver<Said> {
+        &self.said
+    }
+
+    /// A message of the worker's: Some when it is done.
+    pub(crate) fn handle(
+        &mut self,
+        said: Result<Said, crossbeam_channel::RecvError>,
+    ) -> Option<Opened> {
+        match said {
+            Ok(Said::Copying) => {
+                self.deadline = Instant::now() + COPY_TIME + Duration::from_secs(2);
+                None
+            }
+            Ok(Said::Done(result)) => Some(result.map(|placed| (placed.path, placed.file))),
+            Err(_) => Some(Err(Failure::Failed(
+                "the document could not be opened".into(),
+            ))),
+        }
+    }
+
+    /// What the worker said by now, without waiting: Some when it is done.
+    pub fn take(&mut self) -> Option<Opened> {
+        match self.said.try_recv() {
+            Ok(said) => self.handle(Ok(said)),
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.handle(Err(crossbeam_channel::RecvError))
+            }
+        }
+    }
+
+    /// Waits for the worker at most `time`: Some when it is done.
+    pub fn wait(&mut self, time: Duration) -> Option<Opened> {
+        match self.said.recv_timeout(time) {
+            Ok(said) => self.handle(Ok(said)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                self.handle(Err(crossbeam_channel::RecvError))
+            }
+        }
+    }
+
+    /// No longer waited for: the worker lets go of what it opens.
+    pub fn abandon(mut self) {
+        self.abandon.take();
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        // (dropping the sender tells the worker no one waits any more)
+        self.abandon.take();
+    }
+}
+
+/// What [`Opener::begin`] gives.
+pub enum Begun {
+    /// The path at once (a plain path, or a document open already).
+    Ready(String),
+    /// Being opened.
+    Opening(Opening),
+    Failed(Failure),
 }
 
 struct Open {
@@ -58,24 +201,57 @@ impl Opener {
         }
     }
 
-    /// The path the engine opens `uri` under.
-    pub fn open(&mut self, uri: &str, name: &str) -> Result<String, String> {
+    /// Starts opening `uri` (named `name`, whose ending is the decoder's
+    /// hint). The caller waits on the [`Opening`] and hands what it gives to
+    /// [`Opener::finish`].
+    pub fn begin(&mut self, uri: &str, name: &str) -> Begun {
         if !is_document(uri) {
-            return Ok(uri.to_owned());
+            return Begun::Ready(uri.to_owned());
         }
         if let Some(at) = self.open.iter().position(|o| o.uri == uri) {
             // (used again: the last to go)
             let again = self.open.remove(at).expect("the place just found");
             let path = path_text(&again.path);
             self.open.push_back(again);
-            return Ok(path);
+            return Begun::Ready(path);
         }
-        let dir = self.dir.clone().ok_or("no place to open documents in")?;
-        let fd = (self.open_fd)(uri).ok_or("the document cannot be opened")?;
+        let Some(dir) = self.dir.clone() else {
+            return Begun::Failed(Failure::Failed("no place to open documents in".into()));
+        };
         self.count += 1;
         let ending = picked::extension(name).unwrap_or_else(|| "bin".to_owned());
         let path = dir.join(format!("{}.{ending}", self.count));
-        let file = place(fd, &path)?;
+        let (tx, said) = crossbeam_channel::unbounded();
+        let (abandon, abandoned) = crossbeam_channel::bounded::<()>(0);
+        let open_fd = self.open_fd;
+        let target = uri.to_owned();
+        let started = Instant::now();
+        let spawned = std::thread::Builder::new()
+            .name("amp-open".into())
+            .spawn(move || {
+                let result = open_and_place(open_fd, &target, &path, &tx, &abandoned);
+                // (no one waits any more: what was opened goes)
+                if let Err(crossbeam_channel::SendError(Said::Done(Ok(placed)))) =
+                    tx.send(Said::Done(result))
+                {
+                    drop(placed.file);
+                    let _ = std::fs::remove_file(&placed.path);
+                }
+            });
+        if spawned.is_err() {
+            return Begun::Failed(Failure::Failed("no thread to open the document on".into()));
+        }
+        Begun::Opening(Opening {
+            uri: uri.to_owned(),
+            said,
+            deadline: started + OPEN_TIME,
+            started,
+            abandon: Some(abandon),
+        })
+    }
+
+    /// The document an [`Opening`] opened, kept: its path.
+    pub fn finish(&mut self, uri: &str, path: PathBuf, file: Option<File>) -> String {
         self.open.push_back(Open {
             uri: uri.to_owned(),
             path: path.clone(),
@@ -86,7 +262,27 @@ impl Opener {
                 let _ = std::fs::remove_file(&old.path);
             }
         }
-        Ok(path_text(&path))
+        path_text(&path)
+    }
+
+    /// Opens `uri` and waits for it, at most until its deadline (the tests;
+    /// the player's thread waits on [`Opener::begin`] itself).
+    pub fn open(&mut self, uri: &str, name: &str) -> Result<String, Failure> {
+        match self.begin(uri, name) {
+            Begun::Ready(path) => Ok(path),
+            Begun::Failed(failure) => Err(failure),
+            Begun::Opening(mut opening) => loop {
+                let left = opening.deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    opening.abandon();
+                    return Err(Failure::Failed(too_slow()));
+                }
+                if let Some(result) = opening.wait(left) {
+                    let (path, file) = result?;
+                    return Ok(self.finish(uri, path, file));
+                }
+            },
+        }
     }
 
     /// How many tracks are open now.
@@ -95,36 +291,132 @@ impl Opener {
     }
 }
 
+/// The message for a document the system did not hand over in time.
+pub fn too_slow() -> String {
+    format!(
+        "the system did not hand the document over within {} s",
+        OPEN_TIME.as_secs()
+    )
+}
+
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Gives the open descriptor `fd` the name `path`: a link to it where that
-/// can be opened (the descriptor is kept: Some), else a copy (None).
+/// The worker: the descriptor from the system, whether the file is still
+/// being written, then its name in the cache.
+fn open_and_place(
+    open_fd: fn(&str) -> Option<i32>,
+    uri: &str,
+    path: &Path,
+    tx: &Sender<Said>,
+    abandoned: &Receiver<()>,
+) -> Result<Placed, Failure> {
+    let fd = open_fd(uri).ok_or_else(|| Failure::Failed("the document cannot be opened".into()))?;
+    let file = owned(fd)?;
+    if abandoned_now(abandoned) {
+        return Err(Failure::Failed("given up on".into()));
+    }
+    if let Some(why) = still_written(&file, SystemTime::now(), || std::thread::sleep(SECOND_LOOK)) {
+        return Err(Failure::Copying(why));
+    }
+    place(file, path, tx, abandoned)
+}
+
+fn abandoned_now(abandoned: &Receiver<()>) -> bool {
+    matches!(
+        abandoned.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Disconnected)
+    )
+}
+
 #[cfg(unix)]
-fn place(fd: i32, path: &Path) -> Result<Option<File>, String> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+fn owned(fd: i32) -> Result<File, Failure> {
+    use std::os::fd::FromRawFd;
+    if fd < 0 {
+        return Err(Failure::Failed("the document cannot be opened".into()));
+    }
     // Safety: the descriptor was opened for this call and is owned from
     // here on (the Java side detached it; a test hands over one it made).
-    let file = unsafe { File::from_raw_fd(fd) };
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn owned(_fd: i32) -> Result<File, Failure> {
+    Err(Failure::Failed(
+        "documents can only be opened on Android".into(),
+    ))
+}
+
+/// Why `file` is still being written (None: it is not, as far as can be
+/// told). Only a regular file is judged: a pipe has no size to look at.
+/// `pause` waits between the two looks.
+pub fn still_written(file: &File, now: SystemTime, pause: impl FnOnce()) -> Option<String> {
+    let first = file.metadata().ok()?;
+    if !first.is_file() {
+        return None;
+    }
+    if first.len() == 0 {
+        return Some("still being copied (empty so far)".into());
+    }
+    let age = first
+        .modified()
+        .ok()
+        .and_then(|m| now.duration_since(m).ok())
+        .unwrap_or(Duration::MAX);
+    if age < RECENT {
+        return Some(format!(
+            "still being copied (changed {:.1} s ago)",
+            age.as_secs_f32()
+        ));
+    }
+    if age < SETTLING {
+        pause();
+        let second = file.metadata().ok()?;
+        if second.len() != first.len() || second.modified().ok() != first.modified().ok() {
+            return Some("still being copied (it grows)".into());
+        }
+    }
+    None
+}
+
+/// Gives the open `file` the name `path`: a link to it where that can be
+/// opened (the descriptor is kept), else a copy.
+#[cfg(unix)]
+fn place(
+    file: File,
+    path: &Path,
+    tx: &Sender<Said>,
+    abandoned: &Receiver<()>,
+) -> Result<Placed, Failure> {
+    use std::os::fd::AsRawFd;
     let _ = std::fs::remove_file(path);
     let target = format!("/proc/self/fd/{}", file.as_raw_fd());
     let linked = std::os::unix::fs::symlink(&target, path).is_ok()
         && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
         && File::open(path).is_ok();
     if linked {
-        return Ok(Some(file));
+        return Ok(Placed {
+            path: path.to_owned(),
+            file: Some(file),
+        });
     }
     let _ = std::fs::remove_file(path);
-    let mut from = file;
-    let copied = File::create(path)
-        .and_then(|mut to| std::io::copy(&mut from, &mut to))
-        .map_err(|e| format!("the document cannot be read ({e})"));
-    match copied {
-        Ok(bytes) if bytes > 0 => Ok(None),
+    let _ = tx.send(Said::Copying);
+    match copy(
+        file,
+        path,
+        COPY_BYTES,
+        Instant::now() + COPY_TIME,
+        abandoned,
+    ) {
+        Ok(bytes) if bytes > 0 => Ok(Placed {
+            path: path.to_owned(),
+            file: None,
+        }),
         Ok(_) => {
             let _ = std::fs::remove_file(path);
-            Err("the document is empty".into())
+            Err(Failure::Failed("the document is empty".into()))
         }
         Err(e) => {
             let _ = std::fs::remove_file(path);
@@ -134,8 +426,56 @@ fn place(fd: i32, path: &Path) -> Result<Option<File>, String> {
 }
 
 #[cfg(not(unix))]
-fn place(_fd: i32, _path: &Path) -> Result<Option<File>, String> {
-    Err("documents can only be opened on Android".into())
+fn place(
+    _file: File,
+    _path: &Path,
+    _tx: &Sender<Said>,
+    _abandoned: &Receiver<()>,
+) -> Result<Placed, Failure> {
+    Err(Failure::Failed(
+        "documents can only be opened on Android".into(),
+    ))
+}
+
+/// Copies `from` into a new file at `to`: at most `bytes`, until
+/// `deadline`, and not on once no one waits for it.
+fn copy(
+    mut from: File,
+    to: &Path,
+    bytes: u64,
+    deadline: Instant,
+    abandoned: &Receiver<()>,
+) -> Result<u64, Failure> {
+    use std::io::{Read, Write};
+    let fail = |e: std::io::Error| Failure::Failed(format!("the document cannot be read ({e})"));
+    let mut out = File::create(to).map_err(fail)?;
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut copied = 0u64;
+    loop {
+        if Instant::now() > deadline {
+            return Err(Failure::Failed(format!(
+                "copying the document took longer than {} s",
+                COPY_TIME.as_secs()
+            )));
+        }
+        if abandoned_now(abandoned) {
+            return Err(Failure::Failed("given up on".into()));
+        }
+        let read = match from.read(&mut buffer) {
+            Ok(0) => return Ok(copied),
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(fail(e)),
+        };
+        copied += read as u64;
+        if copied > bytes {
+            return Err(Failure::Failed(format!(
+                "the document is larger than {} MiB",
+                bytes >> 20
+            )));
+        }
+        out.write_all(&buffer[..read]).map_err(fail)?;
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -160,6 +500,18 @@ mod tests {
         File::open(path).ok().map(IntoRawFd::into_raw_fd)
     }
 
+    /// A file written a while ago (not one still being copied).
+    fn settled(path: &Path, content: &[u8]) {
+        let mut file = File::create(path).unwrap();
+        file.write_all(content).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+    }
+
+    fn uri(path: &Path) -> String {
+        format!("content://test{}", path.display())
+    }
+
     #[test]
     fn a_plain_path_is_itself() {
         let mut opener = Opener::new(None, open_fd);
@@ -176,21 +528,17 @@ mod tests {
         let music = dir.join("music");
         std::fs::create_dir_all(&music).unwrap();
         let track = music.join("one.flac");
-        File::create(&track)
-            .unwrap()
-            .write_all(b"fLaC and so on")
-            .unwrap();
+        settled(&track, b"fLaC and so on");
         let cache = dir.join("open");
         let mut opener = Opener::new(Some(cache.clone()), open_fd);
 
-        let uri = format!("content://test{}", track.display());
-        let path = opener.open(&uri, "One.FLAC").unwrap();
+        let path = opener.open(&uri(&track), "One.FLAC").unwrap();
         // (in the cache, with the name's ending for the decoder's hint)
         assert!(path.starts_with(&*cache.to_string_lossy()), "{path}");
         assert!(path.ends_with(".flac"), "{path}");
         assert_eq!(std::fs::read(&path).unwrap(), b"fLaC and so on");
         // (opened once: asked again it is the same name)
-        assert_eq!(opener.open(&uri, "One.FLAC").unwrap(), path);
+        assert_eq!(opener.open(&uri(&track), "One.FLAC").unwrap(), path);
         assert_eq!(opener.kept(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -199,11 +547,10 @@ mod tests {
     fn what_cannot_be_opened_says_so() {
         let dir = scratch("missing");
         let mut opener = Opener::new(Some(dir.join("open")), open_fd);
-        assert!(
-            opener
-                .open("content://test/no/such/file.mp3", "file.mp3")
-                .is_err()
-        );
+        assert!(matches!(
+            opener.open("content://test/no/such/file.mp3", "file.mp3"),
+            Err(Failure::Failed(_))
+        ));
         // (and without a cache folder no document at all)
         let mut opener = Opener::new(None, open_fd);
         assert!(opener.open("content://test/x.mp3", "x.mp3").is_err());
@@ -220,12 +567,8 @@ mod tests {
         let mut paths = Vec::new();
         for i in 0..KEEP + 3 {
             let track = music.join(format!("{i}.mp3"));
-            File::create(&track)
-                .unwrap()
-                .write_all(b"ID3 and so on")
-                .unwrap();
-            let uri = format!("content://test{}", track.display());
-            paths.push(opener.open(&uri, &format!("{i}.mp3")).unwrap());
+            settled(&track, b"ID3 and so on");
+            paths.push(opener.open(&uri(&track), &format!("{i}.mp3")).unwrap());
         }
         assert_eq!(opener.kept(), KEEP);
         // (the oldest are gone from the cache, the newest readable)
@@ -247,10 +590,119 @@ mod tests {
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer.write_all(b"OggS and so on").unwrap();
         drop(writer);
-        let kept = place(reader.into_raw_fd(), &path).unwrap();
-        assert!(kept.is_none());
+        let (tx, said) = crossbeam_channel::unbounded();
+        let (_keep, abandoned) = crossbeam_channel::bounded::<()>(0);
+        let file = owned(reader.into_raw_fd()).unwrap();
+        let placed = place(file, &path, &tx, &abandoned).unwrap();
+        assert!(placed.file.is_none());
+        assert!(matches!(said.try_recv(), Ok(Said::Copying)));
         assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
         assert_eq!(std::fs::read(&path).unwrap(), b"OggS and so on");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_still_being_copied_is_not_opened() {
+        let dir = scratch("copying");
+        let mut opener = Opener::new(Some(dir.join("open")), open_fd);
+        // (empty, as a copy is when it starts)
+        let empty = dir.join("empty.flac");
+        File::create(&empty).unwrap();
+        assert!(matches!(
+            opener.open(&uri(&empty), "empty.flac"),
+            Err(Failure::Copying(_))
+        ));
+        // (written to a moment ago)
+        let fresh = dir.join("fresh.mp3");
+        File::create(&fresh)
+            .unwrap()
+            .write_all(b"ID3 half")
+            .unwrap();
+        assert!(matches!(
+            opener.open(&uri(&fresh), "fresh.mp3"),
+            Err(Failure::Copying(_))
+        ));
+        // (a while ago: a whole file)
+        settled(&fresh, b"ID3 whole");
+        assert!(opener.open(&uri(&fresh), "fresh.mp3").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_grows_between_two_looks_is_still_being_copied() {
+        let dir = scratch("grows");
+        let path = dir.join("growing.mp3");
+        // (last changed half a minute ago - then it grows while looked at)
+        let mut writer = File::create(&path).unwrap();
+        writer.write_all(b"ID3 begun").unwrap();
+        writer
+            .set_modified(SystemTime::now() - Duration::from_secs(30))
+            .unwrap();
+        let reader = File::open(&path).unwrap();
+        let why = still_written(&reader, SystemTime::now(), || {
+            writer.write_all(b" and more").unwrap();
+        });
+        assert!(why.is_some_and(|w| w.contains("grows")));
+        // (the same, untouched between the looks: done)
+        let settled_at = SystemTime::now() - Duration::from_secs(30);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(settled_at)
+            .unwrap();
+        assert_eq!(still_written(&reader, SystemTime::now(), || {}), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A provider that does not answer: (a busy phone's) the opening is
+    /// given up on at its deadline and cleans up when it is done.
+    fn stuck(_: &str) -> Option<i32> {
+        std::thread::sleep(Duration::from_millis(600));
+        None
+    }
+
+    #[test]
+    fn a_provider_that_does_not_answer_holds_nothing_up() {
+        let dir = scratch("stuck");
+        let mut opener = Opener::new(Some(dir.join("open")), stuck);
+        let begun = Instant::now();
+        let Begun::Opening(mut opening) = opener.begin("content://slow/a.mp3", "a.mp3") else {
+            panic!("not opening");
+        };
+        // (beginning does not wait)
+        assert!(begun.elapsed() < Duration::from_millis(100));
+        assert!(opening.take().is_none());
+        opening.abandon();
+        // (the worker ends on its own; nothing is left in the cache)
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(std::fs::read_dir(dir.join("open")).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_stops_at_its_byte_budget_and_when_given_up_on() {
+        let dir = scratch("budget");
+        let from = dir.join("big.bin");
+        settled(&from, &[7u8; 4096]);
+        let (_keep, waiting) = crossbeam_channel::bounded::<()>(0);
+        let to = dir.join("copy.bin");
+        let far = Instant::now() + Duration::from_secs(30);
+        assert_eq!(
+            copy(File::open(&from).unwrap(), &to, 1 << 20, far, &waiting),
+            Ok(4096)
+        );
+        assert!(matches!(
+            copy(File::open(&from).unwrap(), &to, 1000, far, &waiting),
+            Err(Failure::Failed(m)) if m.contains("larger")
+        ));
+        // (past its deadline)
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(copy(File::open(&from).unwrap(), &to, 1 << 20, past, &waiting).is_err());
+        // (no one waits)
+        let (gone, abandoned) = crossbeam_channel::bounded::<()>(0);
+        drop(gone);
+        assert!(copy(File::open(&from).unwrap(), &to, 1 << 20, far, &abandoned).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
