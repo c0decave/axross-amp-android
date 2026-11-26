@@ -1,68 +1,5 @@
 # Changelog
 
-## 0.1.1 (unreleased)
-
-- A folder picked while music is still being copied into it no longer
-  holds the app up. The folder's tracks come in batches while it is read
-  (the first plays at once, the list fills behind it; a newer pick ends
-  the reading of an older one); every document is opened off the
-  window's thread with a time limit, and a newer request sets aside an
-  opening the system does not answer; a track still being written (empty,
-  changed in the last 5 s, or growing between two looks) is passed over
-  and tried again later; a copy where a document cannot be opened in
-  place stops at 1 GiB or 60 s.
-- Seeking: 15 s back and on beside play; a long press on previous or next
-  winds back or on, faster the longer it is held; a double tap on the
-  picture's left or right third skips 10 s (more taps skip on), with a
-  hint on the picture; the seek bar is heard while it is dragged, a tap on
-  it jumps there; a seek asked for while a track is still opening is done
-  once it is open; past the end a skip goes on to the next track.
-- Step logs and watchdogs: each step of a pick and of opening a track is
-  logged with its time (file names only in debug builds); a step taking
-  longer than 2 s is logged while it waits, and a main thread blocked for
-  2 s logs the Java stacks and the Rust side's steps.
-- Stability (an audit of crashes, hangs and races):
-  - the activity destroyed - the task swiped away, bold text switched on,
-    "Don't keep activities" - no longer freezes the app: the process ends
-    with it (and every configuration change Android 16 knows is taken
-    without a new activity);
-  - a panic no longer ends the whole app: the library unwinds (a decoder
-    thread that panics on an odd file skips that track; the window's
-    thread ends the process cleanly instead of leaving music without a
-    window); the debug APK is built with the release's settings (no
-    overflow checks or debug assertions);
-  - wgpu's errors are logged instead of ending the app; a lost graphics
-    device moves the faces to the CPU, and where Vulkan failed (the window
-    did not come up, the device was lost) the next start draws with
-    OpenGL ES;
-  - the GPU's measurement at the start runs on a thread of its own with a
-    time limit (a stalling driver no longer blocks the start); the audio
-    focus is asked for off the window's thread;
-  - hidden for 5 s, the app rests: the engine and its output stream end,
-    the meters stop, the watchdogs sleep - no wakelock, no drained
-    battery; shown again, a new engine opens the track where it was;
-  - no sound output (a Bluetooth device that keeps dropping) is retried by
-    itself every 5 to 30 s instead of for good;
-  - tracks still being copied: a pause or the app hidden is no longer
-    overridden by the retry, only one track is tried a round, with growing
-    waits, and a copy that does not go on is given up; an empty file is a
-    failure;
-  - the track playing and the one queued are never let go of by the
-    opener (a seek or a new output read them again); copies go to the
-    cache (the system can reclaim it), 512 MiB at most; no more than 4
-    documents wait on the system at once, and the Java side cancels an
-    opening after 11 s; a file smaller than its provider says is still
-    being copied;
-  - a track that ended as a pause came does not start the next; a wind
-    asked for while a track opens stays a wind.
-- Tests: the decoders on files cut short and damaged (the audit's fuzz, as
-  a test), the copying retries, the opener's limits; the emulator's smoke
-  test now plays music with a file still being copied in, loops rotations
-  and pauses, destroys the activity, runs a monkey, and fails on any ANR,
-  crash or blocked main thread; the APK is checked for 16 KB alignment.
-- New launcher icon: the Synthwave Sun, with a themed-icon layer for
-  Android 13+.
-
 ## 0.1.0 - 2026-11-26
 
 The first build: a proof that axross-amp's player and its visualizations run
@@ -90,6 +27,78 @@ as an Android app. Step 1 of two (see docs/ARCHITECTURE.md).
 - CI: the supply-chain gate, the host's unit tests, debug APKs for
   arm64-v8a and x86_64, a smoke test in an emulator. A release workflow
   that signs with a key from the repository's secrets and drafts a release.
+
+Since the first preview (the debug APK preview-0.1.0-1), after the first
+reports from a phone and an audit of crashes and hangs:
+
+- The app no longer hangs when music starts to play. Keeping the screen
+  on through android-activity's window flags deadlocked the window's
+  thread and Android's main thread as soon as the activity paused (the
+  first track played on, nothing else answered): the screen is kept on by
+  the Java side now.
+- A folder picked while music is still being copied into it no longer
+  holds the app up. The folder's tracks come in batches while it is read
+  (the first plays at once, the list fills behind it; a newer pick ends
+  the reading of an older one); every document is opened off the
+  window's thread with a time limit, and a newer request sets aside an
+  opening the system does not answer; a track still being written (empty,
+  changed in the last 5 s, or growing between two looks) is passed over
+  and tried again later; a copy where a document cannot be opened in
+  place stops at 1 GiB or 60 s.
+- Seeking: 15 s back and on beside play; a long press on previous or next
+  winds back or on, faster the longer it is held; a double tap on the
+  picture's left or right third skips 10 s (more taps skip on), with a
+  hint on the picture; the seek bar is heard while it is dragged, a tap on
+  it jumps there; a seek asked for while a track is still opening is done
+  once it is open; past the end a skip goes on to the next track.
+- Step logs and watchdogs: each step of a pick and of opening a track is
+  logged with its time (file names only in debug builds); a step taking
+  longer than 2 s is logged while it waits, and a main thread blocked for
+  2 s logs the Java stacks and the Rust side's steps.
+- Stability (an audit of crashes, hangs and races):
+  - the activity destroyed - the task swiped away, bold text switched on,
+    "Don't keep activities" - no longer freezes the app: the process ends
+    with it (and every configuration change Android 16 knows is taken
+    without a new activity); a second activity in the same process (a new
+    task started over the old one) starts afresh in a new process instead
+    of a second android_main that cannot draw;
+  - a panic no longer ends the whole app: the library unwinds (a decoder
+    thread that panics on an odd file skips that track; the window's
+    thread ends the process cleanly instead of leaving music without a
+    window); the debug APK is built with the release's settings (no
+    overflow checks or debug assertions);
+  - wgpu's errors are logged instead of ending the app; a lost graphics
+    device moves the faces to the CPU, and where Vulkan failed (the window
+    did not come up, the device was lost) the next start draws with
+    OpenGL ES;
+  - the GPU's measurement at the start runs on a thread of its own with a
+    time limit (a stalling driver no longer blocks the start), and not at
+    all on a software rasterizer; the audio focus and the window's flags
+    are set off the window's thread;
+  - hidden for 5 s, the app rests: the engine and its output stream end,
+    the meters stop, the watchdogs sleep - no wakelock, no drained
+    battery; shown again, a new engine opens the track where it was;
+  - no sound output (a Bluetooth device that keeps dropping) is retried by
+    itself every 5 to 30 s instead of for good;
+  - tracks still being copied: a pause or the app hidden is no longer
+    overridden by the retry, only one track is tried a round, with growing
+    waits, and a copy that does not go on is given up; an empty file is a
+    failure;
+  - the track playing and the one queued are never let go of by the
+    opener (a seek or a new output read them again); copies go to the
+    cache (the system can reclaim it), 512 MiB at most; no more than 4
+    documents wait on the system at once, and the Java side cancels an
+    opening after 11 s; a file smaller than its provider says is still
+    being copied;
+  - a track that ended as a pause came does not start the next; a wind
+    asked for while a track opens stays a wind.
+- Tests: the decoders on files cut short and damaged (the audit's fuzz, as
+  a test), the copying retries, the opener's limits; the emulator's smoke
+  test now plays music with a file still being copied in, loops rotations
+  and pauses, destroys the activity, runs a monkey, and fails on any ANR,
+  crash or blocked main thread; the APK is checked for 16 KB alignment.
+- New launcher icon: the Synthwave Sun, with a themed-icon layer for
+  Android 13+.
 
 Not in it yet: playing in the background, a media notification, lock-screen
 and headset controls, the media library, anything remembered between starts.
