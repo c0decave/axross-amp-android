@@ -218,25 +218,44 @@ fn push(event: Event) {
     }
 }
 
-/// Audio focus is asked for and given up on a thread of its own: the calls
-/// go to the system (binder), and the window's thread - which Android's
-/// lifecycle and input wait on - waits for nobody.
-fn focus_worker() -> &'static crossbeam_channel::Sender<bool> {
-    static WORKER: std::sync::OnceLock<crossbeam_channel::Sender<bool>> =
-        std::sync::OnceLock::new();
+/// What the system is asked on [`system_worker`]'s thread.
+enum Ask {
+    Focus,
+    AbandonFocus,
+    ScreenOn(bool),
+}
+
+/// The calls that go to the system - the audio focus (binder), the
+/// window's flags (the activity's glue) - are made on a thread of their
+/// own: the window's thread, which Android's lifecycle and input wait on,
+/// waits for nobody.
+fn system_worker() -> &'static crossbeam_channel::Sender<Ask> {
+    static WORKER: std::sync::OnceLock<crossbeam_channel::Sender<Ask>> = std::sync::OnceLock::new();
     WORKER.get_or_init(|| {
-        let (tx, rx) = crossbeam_channel::unbounded::<bool>();
+        let (tx, rx) = crossbeam_channel::unbounded::<Ask>();
         let _ = std::thread::Builder::new()
-            .name("amp-focus".into())
+            .name("amp-system".into())
             .spawn(move || {
                 for ask in rx {
-                    if ask {
-                        // (1: granted; 0 refused; -1: the call failed - not
-                        // granted either)
-                        let granted = imp::call(CALL_REQUEST_FOCUS, "") == 1;
-                        push(Event::Focus(granted));
-                    } else {
-                        imp::call(CALL_ABANDON_FOCUS, "");
+                    match ask {
+                        Ask::Focus => {
+                            crate::watch::doing("amp-system", "asking for the audio focus");
+                            // (1: granted; 0 refused; -1: the call failed -
+                            // not granted either)
+                            let granted = imp::call(CALL_REQUEST_FOCUS, "") == 1;
+                            crate::watch::done("amp-system");
+                            push(Event::Focus(granted));
+                        }
+                        Ask::AbandonFocus => {
+                            crate::watch::doing("amp-system", "giving the audio focus up");
+                            imp::call(CALL_ABANDON_FOCUS, "");
+                            crate::watch::done("amp-system");
+                        }
+                        Ask::ScreenOn(on) => {
+                            crate::watch::doing("amp-system", "setting the window's flags");
+                            imp::keep_screen_on(on);
+                            crate::watch::done("amp-system");
+                        }
                     }
                 }
             });
@@ -248,12 +267,12 @@ fn focus_worker() -> &'static crossbeam_channel::Sender<bool> {
 /// as [`Event::Focus`] - false: another app holds it and does not give it
 /// up (a call).
 pub fn ask_audio_focus() {
-    let _ = focus_worker().send(true);
+    let _ = system_worker().send(Ask::Focus);
 }
 
 /// Gives the audio focus up (the music paused by the user).
 pub fn abandon_audio_focus() {
-    let _ = focus_worker().send(false);
+    let _ = system_worker().send(Ask::AbandonFocus);
 }
 
 /// Back at the top of the app: to the home screen (the activity is kept).
@@ -261,9 +280,10 @@ pub fn leave() {
     imp::call(CALL_LEAVE, "");
 }
 
-/// The screen stays on (while music plays under the picture) or may sleep.
+/// The screen stays on (while music plays under the picture) or may sleep
+/// (on the system's thread, see [`system_worker`]).
 pub fn keep_screen_on(on: bool) {
-    imp::keep_screen_on(on);
+    let _ = system_worker().send(Ask::ScreenOn(on));
 }
 
 /// A line for the device's log (logcat, tag `axrossamp`) or the terminal.

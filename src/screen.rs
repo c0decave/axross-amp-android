@@ -244,6 +244,8 @@ impl Screen {
     /// The system's and the engine's news. Also called while the activity
     /// is hidden (eframe's `logic`), when no picture is drawn.
     fn pump(&mut self, ctx: &egui::Context) {
+        // (each part of the news its own step: a stall is said where it is)
+        watch::doing("amp-window", "the system's events");
         for event in platform::poll() {
             match event {
                 Event::Insets(insets) => self.insets = insets,
@@ -314,7 +316,9 @@ impl Screen {
                 Event::Media(command) => self.media(command),
             }
         }
+        watch::doing("amp-window", "the player's news");
         let changed = self.player.pump();
+        watch::doing("amp-window", "a new track's picture");
         if changed.track {
             self.analyzer.new_track();
             if let Some(meters) = self
@@ -328,6 +332,7 @@ impl Screen {
             self.show_art(ctx);
         }
         // the screen stays on while music plays under the picture
+        watch::doing("amp-window", "the screen kept on or not");
         let keep_on = self.player.playing();
         if keep_on != self.screen_kept_on {
             self.screen_kept_on = keep_on;
