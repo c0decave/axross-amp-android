@@ -36,6 +36,9 @@ pub mod watch;
 #[cfg(all(test, target_os = "linux"))]
 mod stall_tests;
 
+#[cfg(test)]
+mod faces_tests;
+
 /// The activity's entry point (the android-activity glue calls it on a
 /// thread of its own once the activity is created).
 #[cfg(target_os = "android")]

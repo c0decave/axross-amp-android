@@ -428,8 +428,8 @@ final class Bridge {
             line(out, uri.toString(), folder, name, size);
             inBatch++;
             total++;
-            int size = sent == 0 ? BATCH_FIRST : BATCH_MORE;
-            if (inBatch >= size || SystemClock.uptimeMillis() - since >= BATCH_MS) {
+            int batch = sent == 0 ? BATCH_FIRST : BATCH_MORE;
+            if (inBatch >= batch || SystemClock.uptimeMillis() - since >= BATCH_MS) {
                 send(true);
             }
         }
