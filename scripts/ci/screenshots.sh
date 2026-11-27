@@ -112,6 +112,9 @@ shot 11-faces-list
 adb shell input keyevent KEYCODE_BACK
 sleep 1
 say "the media notification"
+# (the list from the start again: the faces took longer than the music)
+adb shell am start -W -n "$PACKAGE/$ACTIVITY" --esa amp.paths "$paths" >/dev/null
+sleep 6
 adb shell cmd statusbar expand-notifications
 sleep 3
 # (no shot(): closing the system dialogs would close the shade too)
