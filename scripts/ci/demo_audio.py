@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Demo music for the screenshots: a few short pieces made up here (chords,
 an arpeggio, a beat - nobody's music), written as FLAC with their own tags
-and, for the first, a cover - so the player shows a title, an artist and a
+and the album's cover - so the player shows a title, an artist and a
 picture, and the faces have something to move with.
 
     python3 -I scripts/ci/demo_audio.py OUT_DIR
@@ -152,8 +152,8 @@ def main():
     os.makedirs(out, exist_ok=True)
     pieces = [
         ("01 Glass Harmonics.flac", "Glass Harmonics", 110.0, 0.5, 0, True),
-        ("02 Night Drive.flac", "Night Drive", 130.81, 0.43, 1, False),
-        ("03 Quiet Tide.flac", "Quiet Tide", 98.0, 0.6, 2, False),
+        ("02 Night Drive.flac", "Night Drive", 130.81, 0.43, 1, True),
+        ("03 Quiet Tide.flac", "Quiet Tide", 98.0, 0.6, 2, True),
     ]
     picture = cover()
     for name, title, root, beat, seed, with_cover in pieces:

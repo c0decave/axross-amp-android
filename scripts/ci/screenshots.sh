@@ -136,7 +136,8 @@ adb shell locksettings clear --old 2580 >/dev/null 2>&1
 adb shell wm dismiss-keyguard >/dev/null 2>&1
 sleep 2
 say "on its side"
-adb shell am start -W -n "$PACKAGE/$ACTIVITY" >/dev/null
+# (the list from the start again: playing, not at its end)
+adb shell am start -W -n "$PACKAGE/$ACTIVITY" --esa amp.paths "$paths" >/dev/null
 sleep 2
 adb shell settings put system user_rotation 1
 adb shell wm user-rotation lock 1 >/dev/null 2>&1
