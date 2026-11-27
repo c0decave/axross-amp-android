@@ -84,9 +84,10 @@ git commit -m "New app: axross-amp"
 git push -u origin io.github.c0decave.axrossamp
 ```
 
-In the merge request: say that the app has no network permission and no
-network code, that its only Gradle dependency is the Android Gradle Plugin,
-and point at this file for the checks. Answer the reviewers' questions
+The merge request's title and description, filled in from fdroiddata's
+template: [merge-request.md](merge-request.md). It stays a draft until the
+reproducible-build question below is settled: once F-Droid signs an app
+with its own key, it cannot switch to ours later. Answer the reviewers' questions
 there; they may ask for the test fixtures to be generated at build time
 (then: a small script making the two sine files, and `rm:` for them in the
 recipe).
