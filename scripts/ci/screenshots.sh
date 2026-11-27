@@ -73,11 +73,29 @@ sleep 4
 shot 01-player-controls
 sleep 9
 shot 02-face-spectrum
+# (a swipe to the left: the next face, in the order of the list of faces)
+swipe() { adb shell input swipe $((W * 3 / 4)) $((H / 2)) $((W / 4)) $((H / 2)) 200; sleep "${1:-2}"; }
+face=0
 for i in 3 4 5 6 7 8 9 10; do
-    adb shell input swipe $((W * 3 / 4)) $((H / 2)) $((W / 4)) $((H / 2)) 200
-    sleep 4
+    swipe 4
+    face=$((face + 1))
     shot "$(printf '%02d' "$i")-face"
 done
+# (further faces: the cover (the list's 27th), synthwave (33rd), the
+# galaxy (35th), the skyline (40th))
+to_face() { while [ "$face" -lt "$1" ]; do swipe 2; face=$((face + 1)); done; sleep 4; }
+to_face 26
+shot 17-face-cover
+adb shell input tap $((W / 2)) $((H / 2))
+sleep 1
+shot 18-cover-controls
+sleep 9
+to_face 32
+shot 19-face-synthwave
+to_face 34
+shot 20-face-galaxy
+to_face 39
+shot 21-face-skyline
 say "the list of faces"
 adb shell input tap $((W / 2)) $((H / 2))
 sleep 1
@@ -87,14 +105,12 @@ sleep 2
 shot 11-faces-list
 adb shell input keyevent KEYCODE_BACK
 sleep 1
-say "the seek controls"
-adb shell input tap $((W / 2)) $((H / 2))
-sleep 1
-shot 12-controls
 say "the media notification"
 adb shell cmd statusbar expand-notifications
 sleep 3
-shot 13-notification
+# (no shot(): closing the system dialogs would close the shade too)
+adb exec-out screencap -p > "$OUT/13-notification.png" 2>/dev/null
+say "13-notification.png"
 adb shell cmd statusbar collapse
 sleep 1
 say "the lock screen (a PIN set for it: the emulator has no lock screen)"
@@ -115,13 +131,17 @@ adb shell wm dismiss-keyguard >/dev/null 2>&1
 sleep 2
 say "on its side"
 adb shell am start -W -n "$PACKAGE/$ACTIVITY" >/dev/null
+sleep 2
 adb shell settings put system user_rotation 1
+adb shell wm user-rotation lock 1 >/dev/null 2>&1
 sleep 8
+say "rotation: $(adb shell dumpsys window displays | tr -d '\r' | grep -o 'mCurrentRotation=[^ ]*' | head -1)"
 adb shell input tap $((H / 2)) $((W / 2))
 sleep 1
 shot 15-landscape-controls
 sleep 9
 shot 16-landscape-face
+adb shell wm user-rotation lock 0 >/dev/null 2>&1
 adb shell settings put system user_rotation 0
 adb shell am broadcast -a com.android.systemui.demo -e command exit >/dev/null
 adb logcat -d -s axrossamp:V > "$OUT/app-log.txt"
