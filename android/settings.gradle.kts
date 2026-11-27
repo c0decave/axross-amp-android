@@ -9,6 +9,10 @@ pluginManagement {
                 includeGroupByRegex("androidx.*")
             }
         }
+        // (Maven Central through Google's mirror of it first: Maven Central
+        // itself answers a busy CI runner 429, too many requests, for minutes;
+        // the same artifacts, and Maven Central behind it)
+        maven("https://maven-central.storage-download.googleapis.com/maven2/")
         mavenCentral()
         gradlePluginPortal()
     }
@@ -18,6 +22,7 @@ dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
+        maven("https://maven-central.storage-download.googleapis.com/maven2/")
         mavenCentral()
     }
 }
