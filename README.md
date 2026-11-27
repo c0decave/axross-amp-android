@@ -118,7 +118,7 @@ From the [releases](https://github.com/c0decave/axross-amp-android/releases):
 and `SHA256SUMS`. Check the APK before you install it:
 
 ```sh
-sha256sum -c SHA256SUMS                       # "...apk: OK"
+sha256sum -c --ignore-missing SHA256SUMS      # "...apk: OK"
 apksigner verify --print-certs axross-amp-android-*-arm64-v8a.apk
 # Signer #1 certificate SHA-256 digest:
 #   914f2e01954356f9a8c463512779cbd2ad21d0de7cb3c6ef068de06426978d2a
@@ -131,10 +131,14 @@ source), or with USB debugging on:
 adb install -r axross-amp-android-*-arm64-v8a.apk
 ```
 
-The releases are pre-releases for now. Every CI run also builds a debug APK
-(artifact `axross-amp-android-debug-apk`; arm64-v8a and x86_64), which
-installs as `io.github.c0decave.axrossamp.debug`, next to a release
-(`io.github.c0decave.axrossamp`):
+The releases are pre-releases for now. Each release also has
+`axross-amp-android-X.Y.Z-arm64-v8a-debug.apk` (in the same `SHA256SUMS`):
+the same commit as a debug build, for reports and testing - debuggable,
+signed with the build's debug key (a new one at every release: uninstall
+the last debug APK first), with more in its log. Every CI run builds one
+too (artifact `axross-amp-android-debug-apk`; arm64-v8a and x86_64). A
+debug APK installs as `io.github.c0decave.axrossamp.debug`, next to a
+release (`io.github.c0decave.axrossamp`):
 
 ```sh
 adb install -r app-debug.apk
