@@ -132,15 +132,22 @@ fun cargoNdk(name: String, release: Boolean) = tasks.register<Exec>(name) {
     // cargo-ndk sets no Rust flags of its own, nor does this project)
     val cargoHome = System.getenv("CARGO_HOME")?.takeIf { it.isNotEmpty() }
         ?: File(System.getProperty("user.home"), ".cargo").path
+    // (each as given and as resolved: a path through a symlink stays one)
+    val remaps = setOf(File(cargoHome).absolutePath, File(cargoHome).canonicalPath).map { it to "/cargo" } +
+        setOf(crateDir.absolutePath, crateDir.canonicalPath).map { it to "/axross-amp-android" } +
+        listOfNotNull(System.getenv("ANDROID_NDK_HOME")?.takeIf { it.isNotEmpty() })
+            .flatMap { setOf(File(it).absolutePath, File(it).canonicalPath) }.map { it to "/ndk" }
     environment(
         "CARGO_ENCODED_RUSTFLAGS",
-        // (each as given and as resolved: a path through a symlink stays one)
-        (
-            setOf(File(cargoHome).absolutePath, File(cargoHome).canonicalPath)
-                .map { "--remap-path-prefix=$it=/cargo" } +
-                setOf(crateDir.absolutePath, crateDir.canonicalPath)
-                    .map { "--remap-path-prefix=$it=/axross-amp-android" }
-        ).joinToString("\u001f"),
+        remaps.joinToString("\u001f") { (from, to) -> "--remap-path-prefix=$from=$to" },
+    )
+    // (the same for the C parts - libopus's __FILE__ in its hardening checks,
+    // ring: the cc crate adds CFLAGS to the flags cargo-ndk gives, and cmake
+    // gets them from it)
+    environment(
+        "CFLAGS",
+        (listOfNotNull(System.getenv("CFLAGS")?.takeIf { it.isNotBlank() }) +
+            remaps.map { (from, to) -> "-ffile-prefix-map=$from=$to" }).joinToString(" "),
     )
     doFirst {
         check(!System.getenv("ANDROID_NDK_HOME").isNullOrEmpty()) {

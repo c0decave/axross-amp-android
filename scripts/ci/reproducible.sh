@@ -26,7 +26,7 @@ UNSIGNED=android/app/build/outputs/apk/release/app-release-unsigned.apk
 # A clean clone of this commit (the submodule from this checkout's copy:
 # no network) in DIR, built with CARGO_HOME; the unsigned APK to OUT.
 build_in() {
-    local dir=$1 cargo_home=$2 out=$3
+    local dir=$1 cargo_home=$2 out=$3 ndk=${4:-${ANDROID_NDK_HOME:-}}
     rm -rf "$dir"
     mkdir -p "$(dirname "$dir")" "$cargo_home"
     git clone -q --no-hardlinks "$ROOT" "$dir"
@@ -42,7 +42,7 @@ build_in() {
     (
         cd "$dir"
         unset AMP_KEYSTORE_FILE AMP_KEYSTORE_PASSWORD AMP_KEY_ALIAS AMP_KEY_PASSWORD
-        export CARGO_HOME=$cargo_home
+        export CARGO_HOME=$cargo_home ANDROID_NDK_HOME=$ndk ANDROID_NDK_ROOT=$ndk ANDROID_NDK=$ndk
         export SOURCE_DATE_EPOCH
         SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
         gradle_retrying -p android -Pabis=arm64-v8a assembleRelease
@@ -89,8 +89,11 @@ twice() {
     mkdir -p "$WORK"
     step "Build 1 (a clean clone in $WORK/one)" \
         build_in "$WORK/one/axross-amp-android" "$WORK/one/cargo" "$WORK/first.apk"
-    step "Build 2 (another folder, another Cargo home)" \
-        build_in "$WORK/elsewhere/deeper/two/src" "$WORK/elsewhere/cargo-two" "$WORK/second.apk"
+    # (and the NDK under another name: a symlink, as F-Droid's is elsewhere)
+    mkdir -p "$WORK/elsewhere"
+    ln -sfn "$ANDROID_NDK_HOME" "$WORK/elsewhere/ndk-r28"
+    step "Build 2 (another folder, another Cargo home, the NDK by another path)" \
+        build_in "$WORK/elsewhere/deeper/two/src" "$WORK/elsewhere/cargo-two" "$WORK/second.apk" "$WORK/elsewhere/ndk-r28"
     if cmp -s "$WORK/first.apk" "$WORK/second.apk"; then
         sha256sum "$WORK/first.apk" "$WORK/second.apk" | annotate notice "Reproducible: two clean builds in different folders are the same APK"
     else
