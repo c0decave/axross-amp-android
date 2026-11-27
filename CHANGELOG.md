@@ -15,7 +15,8 @@ the files picked again.
   next, 15 s back / on and the seek bar - in the notification, on the lock
   screen, in Android 13's media controls, from headsets and Bluetooth.
   Previous starts the track again when it is more than 3 s in. Android 13+
-  asks for the notification permission at the first play.
+  asks for the notification permission at the first play. Media keys work
+  with the app on screen too (winit kept them from the session before).
 - What was picked comes back at the next start: the list, the track and
   where it was, paused (the pickers' read permission is kept; a document
   that is gone or no longer readable is said and passed over).

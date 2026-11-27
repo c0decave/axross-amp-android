@@ -258,7 +258,8 @@ uses no other secret (the release itself is made with the run's own token).
    frame, touches, rotation and pause/resume loops, music played with a
    file still being copied in, played on in the background (60 s, 300 s)
    and with the screen off, the media keys (pause, play, play/pause, 15 s
-   on and back, next, previous) checked against the media session, a
+   on and back, next, previous) checked against the media session, also
+   with the app on screen, a
    restart after a force-stop and after a kill bringing the state back,
    the activity destroyed, a monkey - with no crash and no ANR after any
    step.

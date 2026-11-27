@@ -372,11 +372,20 @@ PY
     healthy "the media keys" || return 1
     no_network || return 1
 
-    say "the system's folder picker opened for 10 s, then cancelled: the music plays on"
-    start_activity || return 1
+    # (next and previous left the short tracks playing, over by now: the
+    # long one again, paused, then the play key with the app on screen)
+    say "media keys, the app on screen"
+    adb logcat -c
+    start_activity --esa amp.paths "$dir/0-long.wav" || return 1
+    wait_for_line "opening 0-long.wav (to play" 15 || { say "the long track was not opened again"; return 1; }
     sleep 2
+    media_key KEYCODE_MEDIA_PAUSE
+    wait_state 2 5 || { say "the pause key did not pause with the app on screen"; return 1; }
     media_key KEYCODE_MEDIA_PLAY
-    wait_state 3 5 || return 1
+    wait_state 3 5 || { say "the play key did not play with the app on screen"; return 1; }
+    healthy "the media keys on screen" || return 1
+
+    say "the system's folder picker opened for 10 s, then cancelled: the music plays on"
     local before after
     before=$(played)
     adb shell am start -a android.intent.action.OPEN_DOCUMENT_TREE >/dev/null 2>&1

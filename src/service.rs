@@ -495,8 +495,13 @@ impl Thread {
             2
         };
         // (as shown: a seek just asked for is where the track is, before
-        // the sound has caught up with it)
-        let position = self.player.shown_position();
+        // the sound has caught up with it; a track not open yet starts
+        // where it is asked to, not where the last one was)
+        let position = if self.player.ready() {
+            self.player.shown_position()
+        } else {
+            self.player.seek_pending().unwrap_or(0.0)
+        };
         let p = &self.player;
         let now = platform::Playback {
             state,

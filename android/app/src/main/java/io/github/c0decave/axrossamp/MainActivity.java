@@ -48,6 +48,7 @@ public final class MainActivity extends NativeActivity {
         bridge.edgeToEdge();
         super.onCreate(savedInstanceState);
         bridge.watchInsets();
+        bridge.catchMediaKeys();
         bridge.reportLastExit();
         bridge.testTracks(getIntent());
     }
@@ -81,7 +82,7 @@ public final class MainActivity extends NativeActivity {
 
     @Override
     protected void onStop() {
-        // (no foreground service yet: the music does not go on unseen; the
+        // (the music plays on: the playback service keeps the process; the
         // watchdog does not wake a hidden app)
         Bridge.event(Bridge.EVENT_LIFECYCLE, 0, 0, 0, 0, null);
         bridge.stopWatchdog();

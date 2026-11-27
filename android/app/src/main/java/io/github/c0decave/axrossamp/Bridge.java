@@ -297,6 +297,51 @@ final class Bridge {
         decor.requestApplyInsets();
     }
 
+    /**
+     * Media keys with the app on screen. winit marks every key but the
+     * volume ones as handled, so a headset's or keyboard's media keys would
+     * stop at the window and never reach the media session (which is where
+     * they go with the app in the background). A focused, empty view takes
+     * them before the IME and the native side do, and hands them to the
+     * app's own session: the same commands either way.
+     */
+    void catchMediaKeys() {
+        View catcher = new View(activity) {
+            @Override
+            public boolean onKeyPreIme(int keyCode, android.view.KeyEvent event) {
+                if (!isMediaKey(keyCode)) {
+                    return super.onKeyPreIme(keyCode, event);
+                }
+                Playback playback = Playback.peek();
+                if (playback != null) {
+                    playback.session.getController().dispatchMediaButtonEvent(event);
+                }
+                return true;
+            }
+        };
+        catcher.setFocusable(true);
+        catcher.setFocusableInTouchMode(true);
+        activity.addContentView(catcher, new android.view.ViewGroup.LayoutParams(1, 1));
+        catcher.requestFocus();
+    }
+
+    static boolean isMediaKey(int keyCode) {
+        switch (keyCode) {
+            case android.view.KeyEvent.KEYCODE_MEDIA_PLAY:
+            case android.view.KeyEvent.KEYCODE_MEDIA_PAUSE:
+            case android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+            case android.view.KeyEvent.KEYCODE_HEADSETHOOK:
+            case android.view.KeyEvent.KEYCODE_MEDIA_NEXT:
+            case android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS:
+            case android.view.KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
+            case android.view.KeyEvent.KEYCODE_MEDIA_REWIND:
+            case android.view.KeyEvent.KEYCODE_MEDIA_STOP:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     // -- calls from Rust ----------------------------------------------------------------------
 
     /**

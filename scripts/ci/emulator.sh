@@ -60,6 +60,8 @@ smoke() {
             | grep -E 'AndroidRuntime|FATAL|DEBUG +:|libc +:|linker|UnsatisfiedLink|dlopen|NativeActivity|axross|wgpu|RustPanic|Vulkan|EGL|ActivityManager: (Start proc|Process|Force)|ActivityTaskManager: (START|Displayed)' \
             | head -n 90 | annotate error "logcat, the telling lines (API $api)"
         tail -n 40 "$CI_LOGS/smoke.log" | annotate error "The smoke test's own output (API $api)"
+        # (its steps alone: the app's lines it quotes hide the failing one)
+        grep "^smoke:" "$CI_LOGS/smoke.log" | tail -n 30 | annotate error "The smoke test's steps (API $api)"
     fi
     set -e
     return "$rc"
