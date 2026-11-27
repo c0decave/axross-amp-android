@@ -18,12 +18,36 @@ in the Fastlane layout F-Droid reads from the source.
 
 `versionCode` = major * 10000 + minor * 100 + patch, from Cargo.toml's
 version (android/app/build.gradle.kts): 0.1.0 is 100, 0.1.1 is 101, 1.2.3
-is 10203. It grows with every release as long as minor and patch stay below
+is 10203. It is also written out as `amp.versionCode` in
+`android/gradle.properties` (F-Droid's checkupdates reads it there, see
+`UpdateCheckData`); the build fails when the two disagree, so a release
+changes Cargo.toml's version and that line together. It grows with every release as long as minor and patch stay below
 100. One APK per release (arm64-v8a), so no per-ABI codes. Every release
 needs `fastlane/metadata/android/en-US/changelogs/<versionCode>.txt` (500
 characters at most; de-DE too) and a tag `vX.Y.Z`.
 
 ## A. Official inclusion (fdroiddata)
+
+### Status
+
+- **Submitted on 2026-11-27 as a draft, closed by F-Droid the same day**
+  (fdroiddata merge request !59413): the app has to be maintained for more
+  than three months before inclusion. The repository exists since
+  2026-11-25, so **resubmit on 2027-02-26 at the earliest**, with a new
+  merge request (the closed one is not reopened).
+- **The build itself passed on F-Droid's infrastructure** (fdroiddata
+  pipeline 3123922342): `fdroid build`, lint, rewritemeta, the schema
+  check, the source scan and the APK check. Only `checkupdates` failed
+  ("Couldn't find any version information": the version was computed in
+  the Gradle file, not written anywhere); fixed since with
+  `UpdateCheckData` on `android/gradle.properties` and `Cargo.toml`,
+  checked locally with `fdroid checkupdates --allow-dirty` (it found
+  0.1.1 / 101).
+- **Meanwhile, users get the app from our own F-Droid repository**,
+  https://c0decave.github.io/fdroid/repo (part B), with our signature.
+- For the resubmission: point the recipe at the then newest reproducible
+  release (full commit hash), add `Binaries` and `AllowedAPKSigningKeys`
+  (see "Reproducible builds"), so F-Droid ships our signed APK.
 
 ### What was checked here
 
@@ -41,20 +65,13 @@ characters at most; de-DE too) and a tag `vX.Y.Z`.
 2.4.6) pass on [io.github.c0decave.axrossamp.yml](io.github.c0decave.axrossamp.yml);
 the file is in rewritemeta's form.
 
-### Not tested here (no f-droid.org, gitlab.com or Android SDK in this sandbox)
+### What F-Droid's pipeline confirmed
 
-- `fdroid build -v -l io.github.c0decave.axrossamp` - the real build on
-  F-Droid's build server image. Check in particular:
-  - the `rustup` srclib's version (`srclibs/rustup.yml` in fdroiddata; the
-    recipe says `rustup@1.28.2`) and that Rust 1.100.0 is what built the
-    release (CI installs the then-current stable);
-  - `ndk: r28c` = 28.2.13676358, the NDK in `android/gradle.properties`;
-  - Gradle 8.14.6 known to gradlew-fdroid;
-  - the categories against fdroiddata's `config/categories.yml`
-    (`Local Media Player`, `Multimedia`).
-- fdroiddata's CI (it runs lint, the scanner and a build on the MR).
+Their build server image built the recipe (pipeline 3123922342): the
+rustup from Debian, Rust 1.100.0, NDK r28c, gradlew-fdroid's Gradle, the
+categories. The source scan passed with the Maven mirror line removed.
 
-### What you do (the merge request)
+### What you do (the merge request, from 2027-02-26)
 
 Following F-Droid's [Quick Start Guide](https://f-droid.org/en/docs/Submitting_to_F-Droid_Quick_Start_Guide/):
 
@@ -141,43 +158,26 @@ How close we are (not measured yet - that needs two builds in CI, see
 | `scripts/site.py` | the Pages site: `repo/`, a page with the address, the fingerprint (read from the key) and a QR code |
 | `publish.workflow.yml` (there: `.github/workflows/publish.yml`) | every 6 hours, by hand, or on a `repository_dispatch` "release": fetch, `fdroid update`, sign, publish to Pages. Actions pinned by commit, fdroidserver 2.4.6 from `requirements.txt` with hashes |
 
-Checked here: fetch.py against the real releases (both apps' APKs match
-their SHA256SUMS and certificates). Not run here: `fdroid update` (it needs
-a JDK) and the workflow itself.
+### Status: live
 
-### What is needed (lead / user)
-
-1. **The repository:** a public GitHub repository `c0decave/fdroid` with
-   the content of `docs/fdroid/repo/` (with `publish.workflow.yml` moved to
-   `.github/workflows/publish.yml`); Settings - Pages - Source: GitHub
-   Actions; an environment `fdroid` (Settings - Environments) for the key's
-   secrets. Pushing its workflow file needs the usual Approvals click.
-2. **The key** (made outside this agent, like the release keys):
-
-   ```sh
-   mkdir -p /work/fdroid-repo-key && cd /work/fdroid-repo-key && umask 077
-   keytool -genkeypair -keystore keystore.p12 -storetype PKCS12 \
-       -alias fdroidrepo -keyalg RSA -keysize 4096 -validity 10000 \
-       -dname "CN=c0decave F-Droid repository"
-   keytool -list -v -keystore keystore.p12 -alias fdroidrepo | sed -n 's/.*SHA256: //p' | tr -d ':' > fingerprint.txt
-   base64 -w0 keystore.p12 | gh secret set FDROID_KEYSTORE_BASE64 -R c0decave/fdroid --env fdroid
-   gh secret set FDROID_KEYSTORE_PASS -R c0decave/fdroid --env fdroid   # the store password
-   gh secret set FDROID_KEY_PASS -R c0decave/fdroid --env fdroid        # the same for PKCS12
-   ```
-
-   Keep a backup of the keystore: a lost key means every user has to add
-   the repository again.
-3. Run the workflow once (Actions - publish - Run workflow). The site then
-   shows the address, the fingerprint and the QR code:
-   **https://c0decave.github.io/fdroid/** - users add
-   `https://c0decave.github.io/fdroid/repo` in F-Droid (Settings -
-   Repositories - +) and check the fingerprint. Put the fingerprint into
-   the README's F-Droid section once it exists.
-4. Optional: a fine-grained token with "Contents: read and write" on
-   c0decave/fdroid as a secret of axross-amp-android's release environment,
-   and a last step in the release workflow sending
-   `gh api repos/c0decave/fdroid/dispatches -f event_type=release` - else
-   the six-hourly run picks a release up.
+- https://c0decave.github.io/fdroid/ - the page with the address, the
+  fingerprint and a QR code; the repository is
+  `https://c0decave.github.io/fdroid/repo`.
+- Fingerprint (SHA-256 of the repository key's certificate):
+  `C365C3B1AA63656E4AC0928149D4D20777090401077668EA95C3BD154C28331B`
+  (`fingerprint.txt` there; the workflow stops if the key in its secrets
+  is another one). Checked after the first run: `index-v1.jar` and
+  `entry.jar` are signed by that certificate, `index-v2.json` lists
+  axross-amp 0.1.0 and 0.1.1 (with the Fastlane texts) and the companion
+  0.1.0 - 0.1.3.
+- The key (PKCS12, alias `fdroidrepo`) is kept outside the repository; its
+  secrets are in the environment `fdroid` of c0decave/fdroid.
+- The workflow runs every six hours and by hand; a new release appears at
+  the latest six hours after it is published. Optional: a token with
+  "Contents: read and write" on c0decave/fdroid as a secret of
+  axross-amp-android's release environment, and a last step in the release
+  workflow sending `gh api repos/c0decave/fdroid/dispatches -f
+  event_type=release`.
 
 An app in both repositories (ours and F-Droid's) is only updated across
 them when the signatures match: F-Droid's own builds are signed by

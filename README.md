@@ -156,16 +156,24 @@ adb shell am force-stop io.github.c0decave.axrossamp.debug
 
 ## F-Droid
 
-- **Our own F-Droid repository** (the signed APKs of the releases, as here):
-  being set up at `https://c0decave.github.io/fdroid/repo` - its page will
-  show the fingerprint and a QR code to add it in the F-Droid client.
+- **Our own F-Droid repository**, with the signed APKs of the releases (the
+  same files as here): in the F-Droid client, Settings - Repositories - +,
+  then `https://c0decave.github.io/fdroid/repo` - or open
+  https://c0decave.github.io/fdroid/ on the phone for the link and a QR
+  code. Fingerprint (check that the client shows it):
+  `C365C3B1AA63656E4AC0928149D4D20777090401077668EA95C3BD154C28331B`.
 - **F-Droid's own repository** (built by F-Droid from source): the recipe is
-  in [docs/fdroid/](docs/fdroid/), submitted to fdroiddata.
+  in [docs/fdroid/](docs/fdroid/). F-Droid built it, but includes apps only
+  after three months of maintenance: it is submitted again from 2027-02-26,
+  as a reproducible build with our signature, so installs from either
+  repository update each other.
 
 The store texts and pictures are in `fastlane/metadata/android/` (English,
 German): F-Droid reads them from the source. Every release adds
 `changelogs/<versionCode>.txt` there; `versionCode` is major * 10000 +
-minor * 100 + patch (0.1.1 is 101), so it grows with every release.
+minor * 100 + patch (0.1.1 is 101), so it grows with every release; it is
+also `amp.versionCode` in `android/gradle.properties` (the build checks
+that the two agree).
 
 ## Permissions
 

@@ -14,6 +14,13 @@ val crateVersion: String = Regex("""(?m)^version\s*=\s*"([^"]+)"""")
 val crateVersionCode: Int = crateVersion.substringBefore('-').split('.')
     .map { it.toInt() }
     .let { (major, minor, patch) -> major * 10000 + minor * 100 + patch }
+    .also { computed ->
+        val declared = providers.gradleProperty("amp.versionCode").get().toInt()
+        check(declared == computed) {
+            "android/gradle.properties says amp.versionCode=$declared, but Cargo.toml's " +
+                "version $crateVersion is $computed: change both together"
+        }
+    }
 
 // Which ABIs go into the APK: -Pabis=arm64-v8a (the release) or the default,
 // arm64 for phones and x86_64 for emulators.

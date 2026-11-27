@@ -24,8 +24,10 @@ Builds:
     gradle:
       - yes
     prebuild:
-      - sed -i -e '/maven-central.storage-download.googleapis.com/d' ../settings.gradle.kts
-      - rustup toolchain install 1.100.0 --profile minimal --target aarch64-linux-android
+      - sed -i -e '/maven-central.storage-download.googleapis.com/d' 
+        ../settings.gradle.kts
+      - rustup toolchain install 1.100.0 --profile minimal --target 
+        aarch64-linux-android
       - rustup default 1.100.0
       - cargo install cargo-ndk --version 4.1.2 --locked
     ndk: r28c
@@ -34,5 +36,7 @@ Builds:
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags ^v[0-9]+\.[0-9]+\.[0-9]+$
+UpdateCheckData: 
+  android/gradle.properties|amp\.versionCode=(\d+)|Cargo.toml|(?m)^version\s*=\s*"([^"]+)"
 CurrentVersion: 0.1.1
 CurrentVersionCode: 101
