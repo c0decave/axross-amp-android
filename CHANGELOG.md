@@ -38,6 +38,8 @@ the files picked again.
   test plays on in the background (60 s and 300 s) and with the screen
   off, checks every media key against the media session and the position,
   and restarts after a force-stop and a kill.
+- README with screenshots, taken by CI in an emulator with demo music
+  made up by a script (screenshots.yml; the pictures in docs/screenshots).
 
 ## 0.1.0 - 2026-11-26
 

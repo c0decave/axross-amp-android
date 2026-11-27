@@ -85,7 +85,31 @@ run in CI, but are not a promise.
 
 ## Screenshots
 
-<!-- screenshots -->
+Taken by CI in an Android 14 emulator (Pixel 6 profile,
+[screenshots.yml](.github/workflows/screenshots.yml)), playing demo music
+made up by [a script](scripts/ci/demo_audio.py) - nobody's music, nothing
+personal on the screen. The app has one dark look; there is no light theme.
+There is no playlist view either: the list is the folder or the files picked.
+
+| The player | With the cover | The list of faces |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/player.png" width="240" alt="The player: title, artist and album, the seek bar, previous, 15 s back, pause, 15 s on, next, over the spectrum"> | <img src="docs/screenshots/player-cover.png" width="240" alt="The player over the cover face: the track's cover (a sun over a grid) in a ring of light"> | <img src="docs/screenshots/faces-list.png" width="240" alt="The list of faces, grouped: Spectrum, Mirrored spectrum, Radial spectrum and more"> |
+
+| Mirrored spectrum | Radial spectrum | Particle columns |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/face-mirrored-spectrum.png" width="240" alt="The mirrored spectrum face"> | <img src="docs/screenshots/face-radial-spectrum.png" width="240" alt="The radial spectrum face"> | <img src="docs/screenshots/face-particle-columns.png" width="240" alt="The particle columns face"> |
+
+| Synthwave | Galaxy | Skyline |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/face-synthwave.png" width="240" alt="The synthwave face: a sun over a grid"> | <img src="docs/screenshots/face-galaxy.png" width="240" alt="The galaxy face"> | <img src="docs/screenshots/face-skyline.png" width="240" alt="The skyline face: a city at night under the moon"> |
+
+| The media notification | The lock screen |
+|:---:|:---:|
+| <img src="docs/screenshots/notification.png" width="300" alt="The notification shade's media controls: title, artist, previous, the seek bar, next, 15 s back and on, pause (no cover in it yet)"> | <img src="docs/screenshots/lock-screen.png" width="300" alt="The lock screen's media controls"> |
+
+On its side:
+
+<img src="docs/screenshots/landscape.png" width="640" alt="The player in landscape: the controls over a face">
 
 ## Install
 
