@@ -1,0 +1,18 @@
+# fdroidserver's configuration of this repository (fdroid update reads it).
+# The key: a keystore restored from the repository's secrets by the
+# workflow (never committed), its passwords from the environment.
+repo_url: https://c0decave.github.io/fdroid/repo
+repo_name: c0decave's apps
+repo_description: >-
+  The signed release APKs of axross-amp-android and the axross Android
+  companion, as on their GitHub releases - checked against each release's
+  SHA256SUMS and the apps' signing certificates before they go in.
+repo_icon: icon.png
+archive_older: 0
+keystore: keystore.p12
+repo_keyalias: fdroidrepo
+keystorepass:
+  env: FDROID_KEYSTORE_PASS
+keypass:
+  env: FDROID_KEY_PASS
+keydname: CN=c0decave F-Droid repository

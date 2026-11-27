@@ -1,0 +1,1 @@
+First release: axross-amp's player and its 69 visualizations as an Android app. Music from a folder or files through Android's pickers; one touch screen (swipe for the next face, tap for the controls); 15 s back / on, long press to wind, double tap to jump 10 s; Vulkan or OpenGL ES; no hang while a folder is still being copied in.

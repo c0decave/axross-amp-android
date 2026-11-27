@@ -119,6 +119,13 @@ fun cargoNdk(name: String, release: Boolean) = tasks.register<Exec>(name) {
     // the dev profile's overflow checks and debug assertions)
     command += if (release) listOf("--release") else listOf("--profile", "preview")
     commandLine(command)
+    // (cargo and cargo-ndk where rustup puts them, also when that is not on
+    // the PATH Gradle was started with - F-Droid's build server installs
+    // Rust in a step of its own)
+    val cargoBin = File(System.getProperty("user.home"), ".cargo/bin")
+    if (cargoBin.isDirectory) {
+        environment("PATH", cargoBin.path + File.pathSeparator + (System.getenv("PATH") ?: ""))
+    }
     doFirst {
         check(!System.getenv("ANDROID_NDK_HOME").isNullOrEmpty()) {
             "ANDROID_NDK_HOME is not set: cargo-ndk and libopus's build need the NDK"

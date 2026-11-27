@@ -1,0 +1,38 @@
+Categories:
+  - Local Media Player
+  - Multimedia
+License: Apache-2.0
+AuthorName: c0decave
+SourceCode: https://github.com/c0decave/axross-amp-android
+IssueTracker: https://github.com/c0decave/axross-amp-android/issues
+Changelog: https://github.com/c0decave/axross-amp-android/blob/HEAD/CHANGELOG.md
+
+AutoName: axross-amp
+
+RepoType: git
+Repo: https://github.com/c0decave/axross-amp-android.git
+
+Builds:
+  - versionName: 0.1.1
+    versionCode: 101
+    commit: COMMIT
+    subdir: android/app
+    submodules: true
+    sudo:
+      - apt-get update
+      - apt-get install -y build-essential cmake rustup
+    gradle:
+      - yes
+    prebuild:
+      - sed -i -e '/maven-central.storage-download.googleapis.com/d' ../settings.gradle.kts
+      - rustup toolchain install 1.100.0 --profile minimal --target aarch64-linux-android
+      - rustup default 1.100.0
+      - cargo install cargo-ndk --version 4.1.2 --locked
+    ndk: r28c
+    gradleprops:
+      - abis=arm64-v8a
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags ^v[0-9]+\.[0-9]+\.[0-9]+$
+CurrentVersion: 0.1.1
+CurrentVersionCode: 101

@@ -1,0 +1,1 @@
+Plays on in the background, with the screen off and on the lock screen: a media notification and lock-screen controls (play / pause, previous / next, 15 s back / on, seek). What was picked comes back at the next start. No network permission at all - works fully offline. Opening the picker no longer stops the music. Media keys work with the app on screen too.

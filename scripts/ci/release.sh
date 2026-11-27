@@ -50,6 +50,15 @@ build() {
 
 verify() {
     : "${VERSION:?VERSION is not set}"
+    # (F-Droid and the stores read the release's notes from the source:
+    # fastlane/metadata/android/<locale>/changelogs/<versionCode>.txt)
+    local code
+    code=$(echo "$VERSION" | awk -F'[.-]' '{print $1 * 10000 + $2 * 100 + $3}')
+    for locale in en-US de-DE; do
+        local notes="fastlane/metadata/android/$locale/changelogs/$code.txt"
+        [ -s "$notes" ] || { echo "::error::no $notes (F-Droid's release notes for $VERSION)"; exit 1; }
+        [ "$(wc -c < "$notes")" -le 500 ] || { echo "::error::$notes is longer than F-Droid's 500 characters"; exit 1; }
+    done
     local expected=${AMP_CERT_SHA256:-}
     if [ -z "$expected" ]; then
         echo "::warning::no AMP_CERT_SHA256 variable: the certificate is not checked against an expected one"

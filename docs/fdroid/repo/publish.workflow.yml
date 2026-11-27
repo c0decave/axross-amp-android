@@ -1,0 +1,81 @@
+# (In c0decave/fdroid this file is .github/workflows/publish.yml.)
+# The F-Droid repository on GitHub Pages: every signed release APK of the
+# apps in apps.conf, checked (SHA256SUMS, the signing certificate) by
+# scripts/fetch.py, indexed and signed by fdroidserver with the repository's
+# key, published as the Pages site (https://c0decave.github.io/fdroid/repo).
+# Nothing binary is committed: every run fetches the releases anew.
+#
+# Runs every six hours, by hand, and when an app's release workflow sends a
+# repository_dispatch "release" (optional; needs a token there).
+#
+# The key: secrets FDROID_KEYSTORE_BASE64 (the PKCS12 keystore, base64),
+# FDROID_KEYSTORE_PASS and FDROID_KEY_PASS (README.md, "The key").
+
+name: publish
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: fdroid
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: fdroidserver (pinned, hashes checked)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes -r requirements.txt
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: The releases' APKs, checked
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/fetch.py apps.conf repo metadata
+      - name: The index, signed
+        env:
+          FDROID_KEYSTORE_BASE64: ${{ secrets.FDROID_KEYSTORE_BASE64 }}
+          FDROID_KEYSTORE_PASS: ${{ secrets.FDROID_KEYSTORE_PASS }}
+          FDROID_KEY_PASS: ${{ secrets.FDROID_KEY_PASS }}
+        run: |
+          test -n "$FDROID_KEYSTORE_BASE64" || { echo "::error::no FDROID_KEYSTORE_BASE64 secret"; exit 1; }
+          umask 077
+          printf '%s' "$FDROID_KEYSTORE_BASE64" | base64 --decode > keystore.p12
+          chmod 600 config.yml
+          cp icon.png repo/icon.png
+          fdroid update --use-date-from-apk --pretty
+          python3 -I scripts/site.py keystore.p12 repo site
+          rm -f keystore.p12
+      - name: The key leaves the runner
+        if: always()
+        run: rm -f keystore.p12
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

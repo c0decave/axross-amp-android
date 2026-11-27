@@ -1,0 +1,78 @@
+# DRAFT, not active: to go to .github/workflows/reproducible.yml (a workflow
+# change: the Approvals click). Builds the unsigned release APK of a tag
+# twice, from clean checkouts in two different directories (as F-Droid's
+# build server and our CI differ), and compares them with each other and
+# with the signed release APK, signature left aside (apksigcopier compare,
+# diffoscope's report where they differ).
+
+name: reproducible
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: the release tag to rebuild (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        dir: [a, build-elsewhere/b]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          path: ${{ matrix.dir }}
+          persist-credentials: false
+          submodules: true
+      - name: The toolchain
+        uses: ./a/.github/actions/android-toolchain
+        if: matrix.dir == 'a'
+      - name: The toolchain
+        uses: ./build-elsewhere/b/.github/actions/android-toolchain
+        if: matrix.dir != 'a'
+      - name: The unsigned release APK (arm64-v8a)
+        working-directory: ${{ matrix.dir }}
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          gradle -p android -Pabis=arm64-v8a assembleRelease
+          cp android/app/build/outputs/apk/release/app-release-unsigned.apk "$RUNNER_TEMP/unsigned.apk"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/unsigned.apk
+
+  compare:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: built
+      - name: The release's APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*-arm64-v8a.apk' -D release
+      - name: Compare
+        run: |
+          sudo apt-get install -y --no-install-recommends diffoscope-minimal apksigner >/dev/null
+          python3 -m pip install --user apksigcopier==1.1.1
+          a=built/unsigned-0/unsigned.apk b=built/unsigned-1/unsigned.apk
+          sha256sum "$a" "$b"
+          if cmp -s "$a" "$b"; then echo "::notice::the two builds are identical"; else
+            echo "::warning::the two builds differ"; diffoscope --text - "$a" "$b" | head -n 200 || true; fi
+          signed=$(ls release/*-arm64-v8a.apk)
+          if ~/.local/bin/apksigcopier compare "$signed" --unsigned "$a"; then
+            echo "::notice::the release APK is this build, signed"
+          else
+            echo "::warning::the release APK differs from the rebuild"
+            diffoscope --text - "$signed" "$a" | head -n 200 || true
+          fi

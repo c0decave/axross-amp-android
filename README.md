@@ -154,6 +154,19 @@ adb shell setprop debug.axrossamp.backend gl       # or: vulkan, auto
 adb shell am force-stop io.github.c0decave.axrossamp.debug
 ```
 
+## F-Droid
+
+- **Our own F-Droid repository** (the signed APKs of the releases, as here):
+  being set up at `https://c0decave.github.io/fdroid/repo` - its page will
+  show the fingerprint and a QR code to add it in the F-Droid client.
+- **F-Droid's own repository** (built by F-Droid from source): the recipe is
+  in [docs/fdroid/](docs/fdroid/), submitted to fdroiddata.
+
+The store texts and pictures are in `fastlane/metadata/android/` (English,
+German): F-Droid reads them from the source. Every release adds
+`changelogs/<versionCode>.txt` there; `versionCode` is major * 10000 +
+minor * 100 + patch (0.1.1 is 101), so it grows with every release.
+
 ## Permissions
 
 | Permission | Why |
