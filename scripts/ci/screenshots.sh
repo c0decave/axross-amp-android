@@ -19,6 +19,10 @@ ADB_BIN=$(command -v adb) || { echo "no adb"; exit 1; }
 adb() { timeout --kill-after=10 60 "$ADB_BIN" "$@"; }
 say() { printf 'shots: %s\n' "$*"; }
 shot() {
+    # (a system dialog in the way - the emulator's launcher "isn't
+    # responding" while the emulator is busy - closed first)
+    adb shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS >/dev/null 2>&1
+    sleep 1
     adb exec-out screencap -p > "$OUT/$1.png" 2>/dev/null
     say "$1.png ($(stat -c %s "$OUT/$1.png" 2>/dev/null || echo 0) bytes)"
 }
@@ -27,6 +31,8 @@ density() { adb shell wm density | tr -d '\r' | sed -n 's/.*: \([0-9]*\)$/\1/p' 
 
 mkdir -p "$OUT"
 timeout 300 "$ADB_BIN" wait-for-device
+# (the emulator's own apps settle after the boot first)
+sleep 45
 adb install -r "$APK" || exit 1
 API=$(adb shell getprop ro.build.version.sdk | tr -d '\r')
 [ "${API:-0}" -ge 33 ] && adb shell pm grant "$PACKAGE" android.permission.POST_NOTIFICATIONS
@@ -91,14 +97,20 @@ sleep 3
 shot 13-notification
 adb shell cmd statusbar collapse
 sleep 1
-say "the lock screen"
+say "the lock screen (a PIN set for it: the emulator has no lock screen)"
+adb shell locksettings set-pin 2580 >/dev/null 2>&1
 adb shell input keyevent KEYCODE_SLEEP
 sleep 3
 adb shell input keyevent KEYCODE_WAKEUP
 sleep 3
-shot 14-lock-screen
+adb exec-out screencap -p > "$OUT/14-lock-screen.png" 2>/dev/null
+say "14-lock-screen.png"
 adb shell input keyevent 82
 sleep 2
+adb shell input text 2580
+adb shell input keyevent 66
+sleep 2
+adb shell locksettings clear --old 2580 >/dev/null 2>&1
 adb shell wm dismiss-keyguard >/dev/null 2>&1
 sleep 2
 say "on its side"
