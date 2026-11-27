@@ -38,9 +38,14 @@ versions() {
 }
 
 rust() {
-    rustup toolchain install stable --profile minimal --component clippy
-    rustup default stable
-    rustup target add aarch64-linux-android x86_64-linux-android
+    # (the version rust-toolchain.toml pins, with its targets: every cargo
+    # in this checkout uses it)
+    local channel
+    channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+    [ -n "$channel" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
+    rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt \
+        --target aarch64-linux-android --target x86_64-linux-android
+    rustup default "$channel"
     rustc --version
     cargo --version
 }

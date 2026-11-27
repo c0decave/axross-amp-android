@@ -126,6 +126,22 @@ fun cargoNdk(name: String, release: Boolean) = tasks.register<Exec>(name) {
     if (cargoBin.isDirectory) {
         environment("PATH", cargoBin.path + File.pathSeparator + (System.getenv("PATH") ?: ""))
     }
+    // (a reproducible library: the checkout's and Cargo's home's absolute
+    // paths - in panic messages, file!() - become fixed ones, so a build in
+    // another folder, on F-Droid's build server, is the same byte for byte;
+    // cargo-ndk sets no Rust flags of its own, nor does this project)
+    val cargoHome = System.getenv("CARGO_HOME")?.takeIf { it.isNotEmpty() }
+        ?: File(System.getProperty("user.home"), ".cargo").path
+    environment(
+        "CARGO_ENCODED_RUSTFLAGS",
+        // (each as given and as resolved: a path through a symlink stays one)
+        (
+            setOf(File(cargoHome).absolutePath, File(cargoHome).canonicalPath)
+                .map { "--remap-path-prefix=$it=/cargo" } +
+                setOf(crateDir.absolutePath, crateDir.canonicalPath)
+                    .map { "--remap-path-prefix=$it=/axross-amp-android" }
+        ).joinToString("\u001f"),
+    )
     doFirst {
         check(!System.getenv("ANDROID_NDK_HOME").isNullOrEmpty()) {
             "ANDROID_NDK_HOME is not set: cargo-ndk and libopus's build need the NDK"

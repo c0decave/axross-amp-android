@@ -57,6 +57,12 @@ step "The APK's signature (scripts/ci/verify-apk.sh)" bash scripts/ci/verify-apk
     unzip -l "$APK" | grep -E 'lib/.*\.so' || true
 } | annotate notice "The debug APK"
 
+# (the release APK built twice from clean clones in different folders, as
+# F-Droid builds it: byte for byte the same? Told, not yet a failure)
+if ! bash scripts/ci/reproducible.sh twice; then
+    echo "::warning::the release build is not reproducible yet (scripts/ci/reproducible.sh)"
+fi
+
 if [ ! -f android/gradle/verification-metadata.xml ]; then
     step "Gradle's dependency checksums (to review and commit)" \
         gradle_retrying -p android -PskipCargo --write-verification-metadata sha256 assembleDebug

@@ -1,0 +1,8 @@
+# The Rust every build uses (CI, the release, F-Droid's build server): one
+# version, so that a release can be built again byte for byte. Raise it on
+# purpose, in a commit of its own (docs/fdroid/README.md, "Reproducible").
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["aarch64-linux-android", "x86_64-linux-android"]

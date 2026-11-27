@@ -69,6 +69,10 @@ verify() {
         bash scripts/ci/verify-apk.sh "$BUILT_DEBUG" "" arm64-v8a
     mkdir -p release
     cp "$BUILT" "release/axross-amp-android-$VERSION-arm64-v8a.apk"
+    # (F-Droid ships this very APK only if its own build of the tag is the
+    # same but for the signature: checked here the way F-Droid does)
+    step "Reproducible: a clean rebuild elsewhere is this APK, unsigned (scripts/ci/reproducible.sh)" \
+        bash scripts/ci/reproducible.sh against "release/axross-amp-android-$VERSION-arm64-v8a.apk"
     cp "$BUILT_DEBUG" "release/axross-amp-android-$VERSION-arm64-v8a-debug.apk"
     ls -l release
     sha256sum release/*.apk | annotate notice "The release's APKs"

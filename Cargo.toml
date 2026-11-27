@@ -37,7 +37,10 @@ codegen-units = 1
 # (the symbols stay in the .so cargo builds: Gradle strips the copy in the
 # APK and keeps them for a crash's stack trace)
 strip = false
-debug = "line-tables-only"
+# (no debug info: the APK's copy loses it anyway, and the C parts' (libopus,
+# ring) would carry the build folder's absolute paths into the library's
+# build ID - a build elsewhere, F-Droid's, would differ)
+debug = false
 # (unwind: a panic on one of the engine's threads - a decoder on an odd
 # file - ends that thread, which the engine handles as "it could not be
 # read", and one at a JNI entry is caught there; with abort any panic
