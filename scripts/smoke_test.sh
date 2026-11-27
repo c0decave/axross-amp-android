@@ -291,8 +291,10 @@ PY
     adb shell "rm -f $dir/2-growing.mp3; for i in \$(seq 1 30); do cat /data/local/tmp/amp-source.mp3 >> $dir/2-growing.mp3; sleep 1; done" &
     copier=$!
     sleep 2
-    local paths
-    paths=$(adb shell ls "$dir" | tr -d '\r' | sed "s#^#$dir/#" | paste -sd, -)
+    local paths all
+    all=$(adb shell ls "$dir" | tr -d '\r' | sed "s#^#$dir/#")
+    # (first the short tracks and the one being copied in: it is passed over)
+    paths=$(printf '%s\n' "$all" | grep -v "0-long" | paste -sd, -)
     say "handing over: $paths"
     adb logcat -c
     start_activity --esa amp.paths "$paths" || return 1
@@ -305,6 +307,11 @@ PY
         return 1
     fi
     app_log | grep -E "test tracks|done in|still being copied|tracks in the list|output:" | head -n 12
+    # (then the long track first, for the background: the others behind it)
+    paths=$(printf '%s\n' "$all" | grep -v "growing" | paste -sd, -)
+    say "handing over: $paths"
+    start_activity --esa amp.paths "$paths" || return 1
+    wait_for_line "opening 0-long.wav (to play" 20 || { say "the long track was not opened"; return 1; }
     sleep 5
     [ "$(app_pid)" = "$pid" ] || { say "the process died while playing"; return 1; }
     healthy "the music" || return 1
