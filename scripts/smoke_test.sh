@@ -112,8 +112,10 @@ session_line() {
     adb shell dumpsys media_session 2>/dev/null | tr -d '\r' \
         | awk -v p="package=$PACKAGE" 'index($0, p) { f = 1 } f && /state=PlaybackState/ { print; exit }'
 }
-session_state() { session_line | sed -n 's/.*{state=\([0-9]*\).*/\1/p'; }
-session_position() { session_line | sed -n 's/.*position=\([0-9]*\).*/\1/p'; }
+# (the state as a number - "state=3", or "state=PLAYING(3)" from Android 14)
+session_state() { session_line | grep -oE '\{state=[^,]*' | grep -oE '[0-9]+' | tail -n 1; }
+# (the position right after the state - not the "buffered position" after it)
+session_position() { session_line | sed -n 's/.*{state=[^,]*, position=\([0-9]*\).*/\1/p'; }
 
 # Waits until the session's state is $1, at most $2 seconds.
 wait_state() {
@@ -494,7 +496,18 @@ PY
 timeout 300 "$ADB_BIN" wait-for-device || { say "no device"; exit 1; }
 say "API $API"
 say "installing $APK"
-adb install -r "$APK" || { say "the APK could not be installed"; exit 1; }
+# (an install takes longer than other calls on an emulator just booted:
+# its own time limit, and once more if the first did not end)
+installed=0
+for try in 1 2; do
+    if timeout --kill-after=10 300 "$ADB_BIN" install -r "$APK"; then
+        installed=1
+        break
+    fi
+    say "the install did not end (try $try)"
+    sleep 20
+done
+[ "$installed" = 1 ] || { say "the APK could not be installed"; exit 1; }
 # (Android 13+: the notification permission granted beforehand - its
 # question would come up over the app at the first play)
 if [ "${API:-0}" -ge 33 ]; then

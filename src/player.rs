@@ -606,7 +606,6 @@ impl Player {
     /// call, and names the track that follows to the engine (gapless).
     pub fn pump(&mut self) -> Changed {
         let mut changed = Changed::default();
-        crate::watch::doing("amp-window", "the player: what was opened");
         while let Ok(reply) = self.source.replies.try_recv() {
             match reply {
                 Reply::Opened { generation, path } => {
@@ -626,7 +625,6 @@ impl Player {
                 Reply::Failed { .. } => {}
             }
         }
-        crate::watch::doing("amp-window", "the player: the engine's events");
         while let Ok(event) = self.engine.events.try_recv() {
             match event {
                 Event::Loaded { generation, info } if generation == self.generation => {
@@ -694,7 +692,6 @@ impl Player {
             ));
             self.transport.command(Command::Output(None));
         }
-        crate::watch::doing("amp-window", "the player: the track to follow");
         self.sync_queue();
         changed
     }

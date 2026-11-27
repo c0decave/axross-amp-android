@@ -33,7 +33,7 @@ mkdir -p "$OUT"
 timeout 300 "$ADB_BIN" wait-for-device
 # (the emulator's own apps settle after the boot first)
 sleep 45
-adb install -r "$APK" || exit 1
+timeout --kill-after=10 300 "$ADB_BIN" install -r "$APK" || timeout --kill-after=10 300 "$ADB_BIN" install -r "$APK" || exit 1
 API=$(adb shell getprop ro.build.version.sdk | tr -d '\r')
 [ "${API:-0}" -ge 33 ] && adb shell pm grant "$PACKAGE" android.permission.POST_NOTIFICATIONS
 adb shell settings put system accelerometer_rotation 0

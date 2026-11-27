@@ -68,7 +68,7 @@ impl Rest {
                 if state.round == round && !state.resting {
                     state.resting = true;
                     (me.on_rest)();
-                    crate::platform::log_line("hidden: at rest (no engine, no meters)");
+                    crate::platform::log_line("hidden: the meters rest (the music plays on)");
                 }
             });
     }
