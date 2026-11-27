@@ -40,15 +40,20 @@ adb shell am broadcast -a com.android.systemui.demo -e command notifications -e 
 
 say "the demo music"
 python3 -I "$ROOT/scripts/ci/demo_audio.py" "$OUT/music"
-dir="/sdcard/Android/data/$PACKAGE/files/Demo Tones"
-adb shell mkdir -p "'$dir'"
+# (the app started once first: its folder on the shared storage is made
+# for it then - one made by the shell before it is not readable by the app)
+adb shell am start -W -n "$PACKAGE/$ACTIVITY" >/dev/null
+sleep 5
+adb shell am force-stop "$PACKAGE"
+dir="/sdcard/Android/data/$PACKAGE/files/Demo_Tones"
+adb shell mkdir -p "$dir"
 paths=""
 for f in "$OUT"/music/*.flac; do
     name=$(basename "$f" | tr ' ' '_')
     adb push "$f" "$dir/$name" >/dev/null
     paths="$paths${paths:+,}$dir/$name"
 done
-adb shell "touch -t 202001010000 '$dir'/*"
+adb shell "touch -t 202001010000 $dir/*"
 rm -rf "$OUT/music"
 
 read -r W H <<< "$(size)"
@@ -57,7 +62,7 @@ DPI=$(density)
 px() { echo $(( $1 * DPI / 160 )); }
 say "screen ${W}x${H} at $DPI dpi, API $API"
 
-adb shell am start -W -n "$PACKAGE/$ACTIVITY" --esa amp.paths "'$paths'" >/dev/null
+adb shell am start -W -n "$PACKAGE/$ACTIVITY" --esa amp.paths "$paths" >/dev/null
 sleep 4
 shot 01-player-controls
 sleep 9
@@ -71,7 +76,7 @@ say "the list of faces"
 adb shell input tap $((W / 2)) $((H / 2))
 sleep 1
 # (the "Faces" button: the top bar's first, under the status bar)
-adb shell input tap "$(px 70)" "$(px 60)"
+adb shell input tap "$(px 60)" "$(px 80)"
 sleep 2
 shot 11-faces-list
 adb shell input keyevent KEYCODE_BACK
@@ -99,7 +104,7 @@ sleep 2
 say "on its side"
 adb shell am start -W -n "$PACKAGE/$ACTIVITY" >/dev/null
 adb shell settings put system user_rotation 1
-sleep 5
+sleep 8
 adb shell input tap $((H / 2)) $((W / 2))
 sleep 1
 shot 15-landscape-controls
