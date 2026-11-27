@@ -75,26 +75,32 @@ sleep 9
 shot 02-face-spectrum
 # (a swipe to the left: the next face, in the order of the list of faces)
 swipe() { adb shell input swipe $((W * 3 / 4)) $((H / 2)) $((W / 4)) $((H / 2)) 200; sleep "${1:-2}"; }
-face=0
 for i in 3 4 5 6 7 8 9 10; do
     swipe 4
-    face=$((face + 1))
     shot "$(printf '%02d' "$i")-face"
 done
-# (further faces: the cover (the list's 27th), synthwave (33rd), the
-# galaxy (35th), the skyline (40th))
-to_face() { while [ "$face" -lt "$1" ]; do swipe 2; face=$((face + 1)); done; sleep 4; }
-to_face 26
+# (further faces by their keys, as the app's log names them: a swipe
+# the emulator was too busy for is tried again)
+to_face() {
+    local tries=0
+    while [ "$(adb logcat -d -s axrossamp:V | tr -d '\r' | sed -n 's/.*axrossamp: face: //p' | tail -n 1)" != "$1" ]; do
+        [ "$tries" -lt 60 ] || { say "face $1 not reached"; return 1; }
+        swipe 3
+        tries=$((tries + 1))
+    done
+    sleep 4
+}
+to_face cover
 shot 17-face-cover
 adb shell input tap $((W / 2)) $((H / 2))
 sleep 1
 shot 18-cover-controls
 sleep 9
-to_face 32
+to_face synthwave
 shot 19-face-synthwave
-to_face 34
+to_face galaxy
 shot 20-face-galaxy
-to_face 39
+to_face skyline
 shot 21-face-skyline
 say "the list of faces"
 adb shell input tap $((W / 2)) $((H / 2))

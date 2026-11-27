@@ -545,6 +545,10 @@ impl Screen {
     }
 
     fn set_face(&mut self, key: &'static str) {
+        if key != self.face {
+            // (a face's key, nothing of the user's: also in the release log)
+            platform::log_line(&format!("face: {key}"));
+        }
         self.face = key;
     }
 
