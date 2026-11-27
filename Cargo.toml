@@ -1,6 +1,6 @@
 [package]
 name = "axross-amp-android"
-version = "0.1.0"
+version = "0.1.1"
 description = "axross-amp on Android: the player's engine, analysis and visualizations behind a touch screen"
 license = "Apache-2.0"
 repository = "https://github.com/c0decave/axross-amp-android"

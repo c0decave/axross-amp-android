@@ -6,10 +6,15 @@ desktop program's own library crate (the engine, the analysis, the faces,
 the flash guard), compiled for Android as it is; this repository adds a
 touch screen around it and the little Java an Android app cannot do without.
 
-**Status: step 1, a proof APK.** One screen, music from a folder or files you
-pick, play / pause / seek / previous / next, the faces full screen. It has
-never run on a device or an emulator yet (see [What is verified](#what-is-verified)):
-the first builds happen in this repository's CI.
+**Status: a pre-release.** One screen, music from a folder or files you
+pick, played on in the background and with the screen off, controlled from
+the app, the media notification, the lock screen and a headset; the faces
+full screen. Tested in emulators by CI (see [What is verified](#what-is-verified));
+reports from phones welcome.
+
+**Android 9 (API 28) to 16 (API 36) are supported** and tested in CI's
+emulators (API 28, 34, 36); Android 8.0 / 8.1 (API 26 / 27) install and are
+run in CI, but are not a promise.
 
 > **Photosensitivity warning.** The visualizations move with the music. They
 > are guarded against flashes, red flashes and patterns by the same flash
@@ -24,10 +29,19 @@ the first builds happen in this repository's CI.
 
 ## What works (as built; to be confirmed on devices)
 
+- **Works offline, fully**: no network permission, no network code (see
+  [Privacy](#privacy)).
 - **Music from a folder or from files**, picked with Android's own pickers
-  (the Storage Access Framework). The app asks for no permission at all -
-  not storage, not even the network. A folder is read with its subfolders
-  (up to 5000 tracks), in a folder's natural order.
+  (the Storage Access Framework): no storage permission, no network. A
+  folder is read with its subfolders (up to 5000 tracks), in a folder's
+  natural order. The read permission is kept: at the next start the list,
+  the track and where it was are back, paused - nothing to pick again.
+- **In the background**: the music plays on with the app hidden, the screen
+  off and on the lock screen (a foreground service of the type
+  mediaPlayback with a media notification; Android 13+ asks for the
+  notification permission at the first play). The notification, the lock
+  screen, Android 13's media controls, headsets and Bluetooth have play /
+  pause, previous / next, 15 s back / on and the seek bar.
 - **Every format the desktop plays**: MP3, FLAC, Ogg Vorbis, Opus (libopus,
   compiled in), AAC / ALAC in MP4, WAV, AIFF, CAF, MKA - decoded by
   symphonia, played through cpal on AAudio, gapless from track to track.
@@ -46,20 +60,18 @@ the first builds happen in this repository's CI.
 - **Rotation, cutouts, system bars**: one layout for portrait and landscape,
   drawn edge to edge, the controls kept inside the safe insets.
 - **The screen stays on** while music plays.
-- **Lifecycle**: when the app is hidden the music pauses (see below) and the
-  window's surface is given up; when it is shown again the surface is made
-  anew. Audio focus: a call or another player pauses the music, a short
+- **Lifecycle**: when the app is hidden the picture stops (the window's
+  surface is given up, made anew when it is shown) and the music plays on;
+  paused and hidden for a minute, the sound output is closed until the next
+  play. Audio focus: a call or another player pauses the music, a short
   interruption ends where it began; pulling the headphones out pauses.
 
 ## What does not work yet
 
-- **No playback in the background.** When the app is hidden, the music
-  pauses - on purpose: without a foreground service Android may stop the
-  process at any moment, and music that plays with no notification and no
-  way to stop it is not acceptable. This is step 2.
-- No media notification, no lock-screen or headset controls (step 2:
-  MediaSession), no media library, nothing remembered between starts (the
-  list, the face, the position).
+- Swiping the app away from the recent apps ends it, the music too (the
+  player lives with the activity's process: see docs/ARCHITECTURE.md).
+- No media library (MediaStore), no shuffle or repeat in the screen yet;
+  the face is not remembered between starts.
 - No equalizer, playlists, internet radio, settings, colour schemes other
   than Classic, or Bluetooth view: the desktop's window is not in the APK,
   only its player.
@@ -71,21 +83,40 @@ the first builds happen in this repository's CI.
   cloud storage) is copied into the app's cache before it plays; that takes
   as long as the copy takes.
 
+## Screenshots
+
+<!-- screenshots -->
+
 ## Install
 
-Get `app-debug.apk` from a CI run's artifact (`axross-amp-android-debug-apk`)
-or a signed APK from a release, then with a phone in developer mode and
-USB debugging on:
+From the [releases](https://github.com/c0decave/axross-amp-android/releases):
+`axross-amp-android-X.Y.Z-arm64-v8a.apk` (arm64 phones, Android 9 or later)
+and `SHA256SUMS`. Check the APK before you install it:
+
+```sh
+sha256sum -c SHA256SUMS                       # "...apk: OK"
+apksigner verify --print-certs axross-amp-android-*-arm64-v8a.apk
+# Signer #1 certificate SHA-256 digest:
+#   914f2e01954356f9a8c463512779cbd2ad21d0de7cb3c6ef068de06426978d2a
+```
+
+Then open the APK on the phone (it asks to allow installing from that
+source), or with USB debugging on:
+
+```sh
+adb install -r axross-amp-android-*-arm64-v8a.apk
+```
+
+The releases are pre-releases for now. Every CI run also builds a debug APK
+(artifact `axross-amp-android-debug-apk`; arm64-v8a and x86_64), which
+installs as `io.github.c0decave.axrossamp.debug`, next to a release
+(`io.github.c0decave.axrossamp`):
 
 ```sh
 adb install -r app-debug.apk
 adb shell am start -n io.github.c0decave.axrossamp.debug/io.github.c0decave.axrossamp.MainActivity
 adb logcat -s axrossamp          # the app's own lines
 ```
-
-The debug build installs as `io.github.c0decave.axrossamp.debug`, next to a
-release (`io.github.c0decave.axrossamp`). Android 8.0 (API 26) or later;
-arm64-v8a phones, x86_64 emulators (the debug APK carries both).
 
 If the picture stays black on a device, try the other renderer and tell us
 which one works:
@@ -94,6 +125,30 @@ which one works:
 adb shell setprop debug.axrossamp.backend gl       # or: vulkan, auto
 adb shell am force-stop io.github.c0decave.axrossamp.debug
 ```
+
+## Permissions
+
+| Permission | Why |
+|---|---|
+| `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK` | the playback service that keeps the music playing with the app hidden or the screen off (Android 9+, 14+) |
+| `POST_NOTIFICATIONS` | the media notification with its buttons (Android 13+; asked for at the first play - the lock screen's and quick settings' controls work without it) |
+
+That is all. No storage permission: music comes through Android's pickers,
+which hand over only what you pick (the read permission for it is kept, so
+the next start finds it again). **No network permission** - not INTERNET,
+not even the network's state.
+
+## Privacy
+
+Nothing leaves the phone. The app has no network permission and no
+network code: no update check, no telemetry, no crash reporting, no
+cover or lyrics lookup, no fonts or anything else downloaded - Android does
+not even let it open a socket. It works the same in airplane mode. What it
+keeps (the list picked last, the track and where it was) stays in its own
+files on the phone and goes with the app when it is uninstalled. CI checks
+it on every build: no HTTP or TLS crate in what is compiled for Android, no
+network permission in the APK, and the emulator's tests run in airplane
+mode with the app's process outside Android's network group.
 
 ## Build
 
@@ -140,10 +195,10 @@ And the gate's reviewed baseline (`axross-amp/security/cargo_baseline/`) is
 read from the same commit; `Cargo.lock` here holds no crate the desktop's
 does not (`scripts/check_pins.py` checks that).
 
-The submodule currently points at a commit of axross-amp's `android` branch:
-one change to its `Cargo.toml` (eframe without AccessKit and the desktop's
-window systems on Android). It has to be on GitHub before this repository's
-CI can fetch it - see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The submodule points at axross-amp's branch `android-offline`: v0.17.0 and
+one change - no network code in the Android build (`ureq`, the internet
+radio and the update's fetcher on desktops only). It is on GitHub, so this
+repository's CI can fetch it.
 
 ## Signing
 
@@ -198,10 +253,15 @@ uses no other secret (the release itself is made with the run's own token).
    with the YARA scanners.
 2. **test** - `cargo fmt --check`, clippy, the unit tests on the host.
 3. **apk** - the debug APK for arm64-v8a and x86_64, uploaded as an artifact.
-4. **smoke** - the APK in an emulator (`scripts/smoke_test.sh`): installed,
-   started, the "first frame" line in the log, alive through touches, a
-   rotation and a trip to the home screen and back. Android 14 must pass;
-   Android 8.0 is run and reported.
+4. **smoke** - the APK in emulators of Android 9, 14 and 16 (must pass) and
+   8.0 (run and reported), `scripts/smoke_test.sh`: started, a first
+   frame, touches, rotation and pause/resume loops, music played with a
+   file still being copied in, played on in the background (60 s, 300 s)
+   and with the screen off, the media keys (pause, play, play/pause, 15 s
+   on and back, next, previous) checked against the media session, a
+   restart after a force-stop and after a kill bringing the state back,
+   the activity destroyed, a monkey - with no crash and no ANR after any
+   step.
 
 What the apk and smoke jobs run is in `scripts/ci/` (the tools' versions in
 `scripts/ci/versions.env`, the NDK's in `android/gradle.properties`); a

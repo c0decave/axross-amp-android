@@ -31,6 +31,23 @@ inspect() {
     sha256sum "$APK"
 }
 
+# No network code in the app: no HTTP client, no TLS, no socket library in
+# what is compiled for Android (the desktop crate leaves its internet radio
+# and its update out there).
+offline_crates() {
+    local found
+    found=$(cargo tree --locked --target aarch64-linux-android -e normal --prefix none \
+        | sed 's/ (.*//; s/ v[0-9].*//' | sort -u \
+        | grep -E -x 'ureq|reqwest|hyper|hyper-.*|h2|h3|quinn.*|rustls|rustls-.*|webpki.*|native-tls|openssl|openssl-sys|curl|curl-sys|isahc|surf|attohttpc|tungstenite|tokio-tungstenite|socket2|tokio|async-std|http|httparse|url' || true)
+    if [ -n "$found" ]; then
+        echo "network crates in the Android build:"
+        echo "$found"
+        return 1
+    fi
+    echo "no network crate in the Android build"
+}
+
+step "No network code in the Android build (cargo tree)" offline_crates
 step "The Rust side for Android (clippy, no warnings)" clippy
 step "Debug APK (arm64-v8a and x86_64)" "${GRADLE[@]}" assembleDebug
 step "What is in the APK" inspect

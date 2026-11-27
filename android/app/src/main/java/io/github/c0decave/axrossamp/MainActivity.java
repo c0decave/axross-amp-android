@@ -48,6 +48,7 @@ public final class MainActivity extends NativeActivity {
         bridge.edgeToEdge();
         super.onCreate(savedInstanceState);
         bridge.watchInsets();
+        bridge.reportLastExit();
         bridge.testTracks(getIntent());
     }
 

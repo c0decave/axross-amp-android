@@ -24,7 +24,10 @@ settings() {
     # device (no -noaudio): the smoke test plays music.
     local options="-no-window -gpu swiftshader_indirect -no-boot-anim -no-snapshot -camera-back none -camera-front none"
     case "$api" in
-        26) ram=2048M ;;
+        26 | 28) ram=2048M ;;
+        # (Android 15 and 16: the images come with Google's APIs - a plain
+        # one is not offered for x86_64 there)
+        35 | 36) target=google_apis ;;
     esac
     {
         echo "arch=$arch"
@@ -42,9 +45,9 @@ smoke() {
     local apk=${1:?the APK} out=${2:-smoke-output} rc=0 api
     api=$(timeout 60 adb shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' || true)
     # (a watchdog under the job's own limit: what was found is still told)
-    timeout --kill-after=30 1500 bash scripts/smoke_test.sh "$apk" "$out" 2>&1 \
+    timeout --kill-after=30 2700 bash scripts/smoke_test.sh "$apk" "$out" 2>&1 \
         | tee "$CI_LOGS/smoke.log" || rc=$?
-    [ "$rc" -ne 124 ] || echo "smoke: FAIL - the smoke test did not end within 25 minutes" | tee -a "$CI_LOGS/smoke.log"
+    [ "$rc" -ne 124 ] || echo "smoke: FAIL - the smoke test did not end within 45 minutes" | tee -a "$CI_LOGS/smoke.log"
     set +e
     {
         echo "API $api, $(timeout 60 adb shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"

@@ -1,0 +1,78 @@
+# The README's screenshots: the debug APK in an emulator of a phone's size
+# (Android 14), photographed at defined steps with made-up demo music
+# (scripts/ci/screenshots.sh), and the PNGs committed to the branch
+# "screenshots" - from there they are looked at and picked for
+# docs/screenshots/ by hand. Only this job may write, and only that branch.
+#
+# Its own workflow, not a job of ci.yml: the release calls ci.yml, and a
+# called workflow may not hold more permissions than its caller.
+
+name: screenshots
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "android/**"
+      - "scripts/ci/screenshots.sh"
+      - "scripts/ci/demo_audio.py"
+      - ".github/workflows/screenshots.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screenshots
+  cancel-in-progress: true
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: The toolchain (Rust with the Android targets, cargo-ndk, JDK 17, Gradle, the NDK)
+        uses: ./.github/actions/android-toolchain
+      - name: Earlier builds of the Rust side
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: apk-cargo-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            apk-cargo-${{ hashFiles('Cargo.lock') }}-
+            apk-cargo-
+      - name: Debug APK
+        run: bash scripts/ci/apk.sh
+      - name: KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: The screenshots (Android 14, a phone's size)
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          cores: 3
+          ram-size: 3072M
+          disk-size: 6000M
+          force-avd-creation: true
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-boot-anim -no-snapshot -camera-back none -camera-front none
+          script: bash scripts/ci/screenshots.sh android/app/build/outputs/apk/debug/app-debug.apk shots
+      - name: The screenshots to the branch "screenshots"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/publish-screenshots.sh shots

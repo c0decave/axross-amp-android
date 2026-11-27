@@ -497,3 +497,41 @@ fn the_decoders_survive_files_cut_short_and_damaged() {
     assert!(problems.is_empty(), "{runs} decodes: {problems:#?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_new_pick_that_cannot_be_played_leaves_the_old_track_playing() {
+    let dir = scratch("fallback");
+    let track = dir.join("1 playing.mp3");
+    settled(&track, &fixture("sine.mp3"));
+    let mut player = Player::start(Some(dir.join("open")), open_fd, true, || {});
+    player.set_picked(vec![picked(&track, "1 playing.mp3")], true);
+    pump_until(&mut player, "playing", |p| {
+        p.ready() && p.transport.wants_playing()
+    });
+    // (a new choice: documents nothing can open)
+    player.set_picked(
+        vec![
+            Picked {
+                uri: "content://none/a.mp3".into(),
+                folder: String::new(),
+                name: "a.mp3".into(),
+                size: None,
+            },
+            Picked {
+                uri: "content://none/b.mp3".into(),
+                folder: String::new(),
+                name: "b.mp3".into(),
+                size: None,
+            },
+        ],
+        true,
+    );
+    pump_until(&mut player, "the old track back", |p| {
+        p.status.contains("could not be played")
+    });
+    assert_eq!(player.title(), "1 playing");
+    assert!(player.transport.wants_playing());
+    assert!(player.ready());
+    assert_eq!(player.playlist.tracks.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

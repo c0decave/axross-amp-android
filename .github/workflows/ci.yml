@@ -160,19 +160,26 @@ jobs:
           path: android/gradle/verification-metadata.xml
           if-no-files-found: ignore
 
-  # The APK in an emulator: installed, started, a first frame drawn, alive
-  # through a rotation and a trip to the home screen and back
-  # (scripts/smoke_test.sh). Android 14 must pass; Android 8.0 - the oldest
-  # the app installs on - is told but does not fail the run yet.
+  # The APK in an emulator (scripts/smoke_test.sh): started, a first frame,
+  # touches, rotations, pauses, music played on in the background and with
+  # the screen off, the media keys, restarts that bring the state back, the
+  # activity destroyed, a monkey - no crash, no ANR. Android 9, 14 and 16
+  # must pass; Android 8.0 is told but does not fail the run.
   smoke:
     needs: apk
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
+        # Android 9 (API 28) to 16 (API 36) are supported and must pass;
+        # 8.0 (API 26), the oldest the app installs on, is run and told.
         include:
+          - api: 28
+            required: true
           - api: 34
+            required: true
+          - api: 36
             required: true
           - api: 26
             required: false

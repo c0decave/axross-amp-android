@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.1.1 - 2026-11-27
+
+From the first phone's report on 0.1.0: the music stopped (and the app
+seemed to crash) when it went to the background, and every start wanted
+the files picked again.
+
+- Music plays on in the background: with the app hidden, the screen off,
+  on the lock screen. The player runs on a thread of its own for as long
+  as the process lives (it no longer depends on the window, which Android
+  takes away when the app is hidden), and a foreground service of the type
+  mediaPlayback keeps the process while music plays.
+- A media session with a media notification: play / pause, previous /
+  next, 15 s back / on and the seek bar - in the notification, on the lock
+  screen, in Android 13's media controls, from headsets and Bluetooth.
+  Previous starts the track again when it is more than 3 s in. Android 13+
+  asks for the notification permission at the first play.
+- What was picked comes back at the next start: the list, the track and
+  where it was, paused (the pickers' read permission is kept; a document
+  that is gone or no longer readable is said and passed over).
+- Hidden, only the picture stops: the meters rest after 5 s; paused and
+  hidden for a minute the sound output is closed until the next play.
+- No network at all: the app asks for no network permission and has no
+  network code - the desktop crate leaves its internet radio and its
+  update out of the Android build (no HTTP client, no TLS). Everything
+  works in airplane mode. CI fails on a network crate in the Android
+  build or a network permission in the APK, and runs the emulator's tests
+  offline with the app's process outside Android's network group.
+- The music plays on while a picker is open; a new pick changes the track
+  only when the new one is open, and one that cannot be played leaves the
+  old track playing, said.
+- How the app ended last time (Android 11+) is logged, and a crash or an
+  ANR is said on the screen at the next start - for the next report.
+- Supported: Android 9 (API 28) to 16 (API 36), tested in CI's emulators
+  of API 28, 34 and 36 (and run on 26, which still installs); the smoke
+  test plays on in the background (60 s and 300 s) and with the screen
+  off, checks every media key against the media session and the position,
+  and restarts after a force-stop and a kill.
+
 ## 0.1.0 - 2026-11-26
 
 The first build: a proof that axross-amp's player and its visualizations run

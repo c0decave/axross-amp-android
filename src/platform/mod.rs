@@ -32,6 +32,9 @@ pub const CALL_ABANDON_FOCUS: i32 = 5;
 pub const CALL_LEAVE: i32 = 6;
 /// The screen kept on ("1") or not ("0").
 pub const CALL_SCREEN_ON: i32 = 7;
+/// The player's state for the media session, its notification and the
+/// playback service (see [`Playback`]).
+pub const CALL_PLAYBACK: i32 = 8;
 
 // Java -> Rust (Bridge.event)
 pub const EVENT_INSETS: i32 = 1;
@@ -45,6 +48,8 @@ pub const EVENT_MEDIA: i32 = 6;
 /// The Java side's watchdog: the main thread has been blocked `a` ms (the
 /// Rust side's steps go to the log at once).
 pub const EVENT_STALL: i32 = 7;
+/// A line to show (`text`): how the app ended last time, if it crashed.
+pub const EVENT_NOTE: i32 = 8;
 
 pub const MEDIA_PLAY: i32 = 1;
 pub const MEDIA_PAUSE: i32 = 2;
@@ -56,6 +61,9 @@ pub const MEDIA_STOP: i32 = 6;
 /// MediaSession) - the same skips as the buttons.
 pub const MEDIA_FORWARD: i32 = 7;
 pub const MEDIA_REWIND: i32 = 8;
+/// To `b` milliseconds into the track (the notification's, the lock
+/// screen's seek bar).
+pub const MEDIA_SEEK_TO: i32 = 9;
 
 // android.media.AudioManager's AUDIOFOCUS_* values
 const FOCUS_GAIN: i32 = 1;
@@ -100,26 +108,110 @@ pub enum Event {
     Shown(bool),
     /// Told for the picture's sake; the music was already seen to.
     Interrupted(Interrupt),
-    /// A media command (step 2).
-    Media(i32),
+    /// A line to show (how the app ended last time).
+    Note(String),
+}
+
+/// What goes to the player at once, on its own thread (see
+/// [`set_player_hook`]): it plays on while no window is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToPlayer {
+    /// A media command (the notification's, the lock screen's, a headset's,
+    /// Bluetooth's): one of the `MEDIA_*`, with its argument.
+    Media(i32, i32),
     /// The answer to [`ask_audio_focus`]: whether the music may play.
     Focus(bool),
 }
 
+/// The player's state as the system shows it (the media session, its
+/// notification, the lock screen) and keeps the playback service for.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Playback {
+    /// 0 nothing to play, 1 stopped, 2 paused, 3 playing (as
+    /// android.media.session.PlaybackState counts).
+    pub state: i32,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+}
+
+impl Playback {
+    /// The line the Java side reads (Playback.update).
+    pub fn to_line(&self) -> String {
+        let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            self.state,
+            self.position_ms,
+            self.duration_ms,
+            clean(&self.title),
+            clean(&self.artist),
+            clean(&self.album)
+        )
+    }
+}
+
 type Waker = Box<dyn Fn() + Send>;
 type InterruptHook = Box<dyn Fn(Interrupt) + Send>;
+type PlayerHook = Box<dyn Fn(ToPlayer) + Send>;
+type LifecycleHook = Box<dyn Fn(bool) + Send>;
 
 struct Hub {
     events: Vec<Event>,
     waker: Option<Waker>,
     interrupt: Option<InterruptHook>,
+    player: Option<PlayerHook>,
+    /// What came for the player before it was there (a media button that
+    /// started the app).
+    early: Vec<ToPlayer>,
+    lifecycle: Option<LifecycleHook>,
 }
 
 static HUB: Mutex<Hub> = Mutex::new(Hub {
     events: Vec::new(),
     waker: None,
     interrupt: None,
+    player: None,
+    early: Vec::new(),
+    lifecycle: None,
 });
+
+/// Called at once, on the Java side's thread, when the activity is shown
+/// (true) or hidden: while hidden no frame comes to read an event.
+pub fn set_lifecycle_hook(hook: impl Fn(bool) + Send + 'static) {
+    hub().lifecycle = Some(Box::new(hook));
+}
+
+/// The tests that use the process's hub one after another.
+#[cfg(test)]
+pub static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// No player any more (the tests).
+#[cfg(test)]
+pub fn clear_player_hook() {
+    let mut hub = hub();
+    hub.player = None;
+    hub.early.clear();
+}
+
+/// Called at once with what is for the player (its thread's channel).
+pub fn set_player_hook(hook: impl Fn(ToPlayer) + Send + 'static) {
+    let mut hub = hub();
+    for early in std::mem::take(&mut hub.early) {
+        hook(early);
+    }
+    hub.player = Some(Box::new(hook));
+}
+
+fn to_player(what: ToPlayer) {
+    let mut hub = hub();
+    match hub.player.as_ref() {
+        Some(hook) => hook(what),
+        None => hub.early.push(what),
+    }
+}
 
 fn hub() -> std::sync::MutexGuard<'static, Hub> {
     HUB.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -169,7 +261,14 @@ pub fn dispatch(kind: i32, a: i32, b: i32, c: i32, d: i32, text: &str) {
             ));
             return;
         }
-        EVENT_LIFECYCLE => (Event::Shown(a != 0), (a == 0).then_some(Interrupt::Hidden)),
+        // (hidden, the music plays on: the playback service keeps it; who
+        // must know is told at once)
+        EVENT_LIFECYCLE => {
+            if let Some(hook) = hub().lifecycle.as_ref() {
+                hook(a != 0);
+            }
+            (Event::Shown(a != 0), None)
+        }
         EVENT_AUDIO_FOCUS => {
             let what = match a {
                 FOCUS_GAIN => Interrupt::FocusBack,
@@ -182,7 +281,8 @@ pub fn dispatch(kind: i32, a: i32, b: i32, c: i32, d: i32, text: &str) {
             (Event::Interrupted(what), Some(what))
         }
         EVENT_NOISY => (Event::Interrupted(Interrupt::Noisy), Some(Interrupt::Noisy)),
-        EVENT_MEDIA => (Event::Media(a), None),
+        EVENT_MEDIA => return to_player(ToPlayer::Media(a, b)),
+        EVENT_NOTE => (Event::Note(text.to_owned()), None),
         _ => return,
     };
     {
@@ -225,6 +325,7 @@ enum Ask {
     Focus,
     AbandonFocus,
     ScreenOn(bool),
+    Playback(String),
 }
 
 /// The calls that go to the system - the audio focus (binder), the
@@ -246,11 +347,16 @@ fn system_worker() -> &'static crossbeam_channel::Sender<Ask> {
                             // not granted either)
                             let granted = imp::call(CALL_REQUEST_FOCUS, "") == 1;
                             crate::watch::done("amp-system");
-                            push(Event::Focus(granted));
+                            to_player(ToPlayer::Focus(granted));
                         }
                         Ask::AbandonFocus => {
                             crate::watch::doing("amp-system", "giving the audio focus up");
                             imp::call(CALL_ABANDON_FOCUS, "");
+                            crate::watch::done("amp-system");
+                        }
+                        Ask::Playback(line) => {
+                            crate::watch::doing("amp-system", "telling the media session");
+                            imp::call(CALL_PLAYBACK, &line);
                             crate::watch::done("amp-system");
                         }
                         Ask::ScreenOn(on) => {
@@ -265,9 +371,9 @@ fn system_worker() -> &'static crossbeam_channel::Sender<Ask> {
     })
 }
 
-/// Asks for the audio focus (the music is about to play): the answer comes
-/// as [`Event::Focus`] - false: another app holds it and does not give it
-/// up (a call).
+/// Asks for the audio focus (the music is about to play): the answer goes
+/// to the player ([`ToPlayer::Focus`]) - false: another app holds it and
+/// does not give it up (a call).
 pub fn ask_audio_focus() {
     let _ = system_worker().send(Ask::Focus);
 }
@@ -275,6 +381,12 @@ pub fn ask_audio_focus() {
 /// Gives the audio focus up (the music paused by the user).
 pub fn abandon_audio_focus() {
     let _ = system_worker().send(Ask::AbandonFocus);
+}
+
+/// The player's state to the media session (its notification, the lock
+/// screen) and the playback service: on the system's thread.
+pub fn playback(state: &Playback) {
+    let _ = system_worker().send(Ask::Playback(state.to_line()));
 }
 
 /// Back at the top of the app: to the home screen (the activity is kept).
@@ -302,6 +414,8 @@ mod tests {
     // (one test: the hub is the process's)
     #[test]
     fn events_are_queued_and_interrupts_are_told_at_once() {
+        let _one_at_a_time = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_player_hook();
         let woken = Arc::new(AtomicUsize::new(0));
         let told = Arc::new(Mutex::new(Vec::new()));
         let (w, t) = (woken.clone(), told.clone());
@@ -337,7 +451,9 @@ mod tests {
         );
         dispatch(EVENT_AUDIO_FOCUS, 77, 0, 0, 0, "");
         dispatch(EVENT_NOISY, 0, 0, 0, 0, "");
+        // (for the player, at once: before it is there, kept for it)
         dispatch(EVENT_MEDIA, MEDIA_NEXT, 0, 0, 0, "");
+        dispatch(EVENT_MEDIA, MEDIA_SEEK_TO, 12_000, 0, 0, "");
         // (logged at once, nothing queued)
         dispatch(EVENT_STALL, 2500, 0, 0, 0, "");
         dispatch(999, 0, 0, 0, 0, "");
@@ -346,7 +462,6 @@ mod tests {
         assert_eq!(
             *told.lock().unwrap(),
             [
-                Interrupt::Hidden,
                 Interrupt::FocusLostForNow,
                 Interrupt::FocusBack,
                 Interrupt::FocusLost,
@@ -372,8 +487,32 @@ mod tests {
         assert_eq!(events[2], Event::NoPicker);
         assert_eq!(events[3], Event::Shown(true));
         assert_eq!(events[4], Event::Shown(false));
-        assert_eq!(events[9], Event::Media(MEDIA_NEXT));
-        assert_eq!(events.len(), 10);
+        assert_eq!(events.len(), 9);
         assert!(poll().is_empty());
+        // (the media commands went to the player, kept until it is there)
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        set_player_hook(move |what| g.lock().unwrap().push(what));
+        dispatch(EVENT_MEDIA, MEDIA_PAUSE, 0, 0, 0, "");
+        assert_eq!(
+            *got.lock().unwrap(),
+            [
+                ToPlayer::Media(MEDIA_NEXT, 0),
+                ToPlayer::Media(MEDIA_SEEK_TO, 12_000),
+                ToPlayer::Media(MEDIA_PAUSE, 0),
+            ]
+        );
+        assert_eq!(
+            Playback {
+                state: 3,
+                position_ms: 1500,
+                duration_ms: 200_000,
+                title: "A\ttitle".into(),
+                artist: "Someone".into(),
+                album: String::new(),
+            }
+            .to_line(),
+            "3\t1500\t200000\tA title\tSomeone\t"
+        );
     }
 }

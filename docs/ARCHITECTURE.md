@@ -127,14 +127,42 @@ defaults - a phone that offers 4096-pixel textures still gets a device.
 smoke test retries with `gl` when the app's own choice gets no first frame
 (and says so as a warning).
 
-**The music pauses when the app is hidden.** See the README. Technically the
-engine could keep playing for a while; it would be killed without warning.
+**The player has a thread of its own; the music plays on in the
+background** (0.1.1). On Android, eframe drops the window when the activity
+stops and calls the app no more until it is shown again, so nothing in the
+window can drive the player while the app is hidden. `service.rs` runs the
+`Player` on the `amp-player` thread for the process's life; the screen
+holds a `Handle` (commands to that thread, a `View` of what to show, the
+position from the engine's shared state). The thread waits for work - a
+command, the engine's or the opening thread's news, a retry - and wakes
+otherwise only every 15 s while music plays, to keep the position saved.
+The system's media commands (`EVENT_MEDIA`, from the session and the
+notification) and the audio focus's answer go to that thread directly
+(`platform::set_player_hook`), not through a frame.
+
+Java's side (framework classes only, no AndroidX): `Playback` holds one
+`MediaSession` for the process and builds the `MediaStyle` notification;
+`PlaybackService` is a foreground service of the type mediaPlayback while
+music plays (out of the foreground, its notification dismissable, while
+paused; ended when nothing is left to play or the notification is swiped
+away); `MediaActions` takes the notification's buttons as broadcasts (they
+work with the app in the background, where a service start would not).
+The player tells every change through `CALL_PLAYBACK` (state, position,
+length, title, artist, album). Android 9 needs FOREGROUND_SERVICE, 10+ the
+type in the manifest, 14+ FOREGROUND_SERVICE_MEDIA_PLAYBACK and the type at
+`startForeground`; 12+ allows the service's start only from the user's
+play and the session's or notification's commands - a start refused
+elsewhere is logged, and the music plays on.
+
+The state is kept in the app's files (`saved.rs`: the picked tracks, the
+current one, the position) and the pickers' read permissions are taken as
+persistable, so the next start opens the same track where it was, paused.
 
 **The process ends when the activity does.** winit cannot create a second
 event loop in a process, and Android may start the activity again in the
-same one. `android_main` therefore exits the process when the window is
-gone; the next start is a fresh one. (With step 2's service the player
-moves out of the activity's lifetime - see below.)
+same one. `MainActivity.onDestroy` therefore ends the process (the task
+swiped away ends the music too), and a second activity in a process that
+ran android_main already is started afresh in a new one.
 
 **Application id `io.github.c0decave.axrossamp`** (debug builds add
 `.debug`). It follows the repository's home; nobody else can claim that
@@ -186,7 +214,10 @@ they are the first things to look at if the first CI run fails.
 
 What step 1 leaves in place for it, and what it takes.
 
-1. **The player out of the activity.** Today `Screen` owns `Player`. For
+Done in 0.1.1: items 2 and 3, and item 1 as far as the player's thread
+(not past the activity's destruction: winit's one event loop a process).
+
+1. **The player out of the activity.** Before 0.1.1 `Screen` owned `Player`. For
    playback to outlive the activity, the player has to live in the process,
    not in the window: a `static` player service in Rust (the `Player` as it
    is - it knows no window) that the screen attaches to when there is one.

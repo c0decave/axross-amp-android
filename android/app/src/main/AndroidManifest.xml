@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- No permission is asked for: music comes through the Storage Access
-         Framework's pickers; the proof has no radio and no updater, so not
-         even INTERNET. Step 2 adds FOREGROUND_SERVICE(_MEDIA_PLAYBACK) and
-         POST_NOTIFICATIONS for playing in the background. -->
+    <!-- Music from the Storage Access Framework's pickers: no storage
+         permission. Playing on with the app hidden or the screen off: a
+         foreground service of the type mediaPlayback (Android 9 needs
+         FOREGROUND_SERVICE, 14+ also FOREGROUND_SERVICE_MEDIA_PLAYBACK),
+         its notification (13+: POST_NOTIFICATIONS, asked for at the first
+         play). No INTERNET: no radio, no updater. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Vulkan where the device has it, OpenGL ES 3 otherwise (wgpu). -->
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
@@ -44,5 +49,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Keeps the process while music plays (see PlaybackService). -->
+        <service
+            android:name=".PlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- The media notification's buttons (see MediaActions). -->
+        <receiver
+            android:name=".MediaActions"
+            android:exported="false" />
     </application>
 </manifest>

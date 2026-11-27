@@ -54,6 +54,7 @@ final class Bridge {
     static final int CALL_ABANDON_FOCUS = 5;
     static final int CALL_LEAVE = 6;
     static final int CALL_SCREEN_ON = 7;
+    static final int CALL_PLAYBACK = 8;
 
     // Java -> Rust (event)
     static final int EVENT_INSETS = 1;
@@ -61,10 +62,23 @@ final class Bridge {
     static final int EVENT_LIFECYCLE = 3;
     static final int EVENT_AUDIO_FOCUS = 4;
     static final int EVENT_NOISY = 5;
-    /** Reserved for step 2 (MediaSession callbacks): a = the command. */
+    /** A media command (the session's, the notification's): a = MEDIA_*, b = its argument. */
     static final int EVENT_MEDIA = 6;
     /** The main thread has been blocked a = that many ms (the watchdog). */
     static final int EVENT_STALL = 7;
+    /** A line to show (text): how the app ended last time, if it crashed. */
+    static final int EVENT_NOTE = 8;
+
+    // the media commands (src/platform/mod.rs, MEDIA_*)
+    static final int MEDIA_PLAY = 1;
+    static final int MEDIA_PAUSE = 2;
+    static final int MEDIA_TOGGLE = 3;
+    static final int MEDIA_NEXT = 4;
+    static final int MEDIA_PREVIOUS = 5;
+    static final int MEDIA_STOP = 6;
+    static final int MEDIA_FORWARD = 7;
+    static final int MEDIA_REWIND = 8;
+    static final int MEDIA_SEEK_TO = 9;
 
     private static final int REQUEST_FOLDER = 4201;
     private static final int REQUEST_FILES = 4202;
@@ -309,6 +323,10 @@ final class Bridge {
                 case CALL_LEAVE:
                     activity.runOnUiThread(() -> activity.moveTaskToBack(true));
                     return 0;
+                case CALL_PLAYBACK:
+                    Playback.get(activity).update(arg);
+                    askForNotifications(arg);
+                    return 0;
                 case CALL_SCREEN_ON: {
                     // (posted: never waited for - see keep_screen_on in
                     // src/platform/android.rs)
@@ -393,6 +411,7 @@ final class Bridge {
             event(EVENT_PICKED, 0, 0, pick, 0, "");
             return;
         }
+        keepPermission(data, request == REQUEST_FOLDER);
         // (a folder is read off the main thread: it may hold thousands, and
         // a busy provider answers slowly)
         Thread reader = new Thread(() -> {
@@ -414,6 +433,115 @@ final class Bridge {
                     + (batches.current() ? "" : " (a newer pick came)"));
         }, "amp-picked");
         reader.start();
+    }
+
+    /**
+     * The read permission for what was picked, kept across restarts (the
+     * player opens the same tracks at the next start, nothing to pick
+     * again); the ones kept for earlier picks are given back (Android
+     * keeps a limited number for an app).
+     */
+    private void keepPermission(Intent data, boolean folder) {
+        ContentResolver resolver = activity.getContentResolver();
+        java.util.HashSet<Uri> keep = new java.util.HashSet<>();
+        if (folder || data.getClipData() == null) {
+            if (data.getData() != null) {
+                keep.add(data.getData());
+            }
+        } else {
+            ClipData clip = data.getClipData();
+            for (int i = 0; i < clip.getItemCount(); i++) {
+                if (clip.getItemAt(i).getUri() != null) {
+                    keep.add(clip.getItemAt(i).getUri());
+                }
+            }
+        }
+        int kept = 0;
+        for (Uri uri : keep) {
+            try {
+                resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                kept++;
+            } catch (RuntimeException e) {
+                // (a provider that gives no lasting permission: it plays
+                // now, and must be picked again after a restart)
+                Log.w(TAG, "no lasting permission for " + (debuggable ? uri : "a document") + ": " + e);
+            }
+        }
+        for (android.content.UriPermission old : resolver.getPersistedUriPermissions()) {
+            if (!keep.contains(old.getUri())) {
+                try {
+                    resolver.releasePersistableUriPermission(old.getUri(), Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (RuntimeException e) {
+                    Log.w(TAG, "an old permission could not be given back: " + e);
+                }
+            }
+        }
+        Log.i(TAG, "lasting read permission for " + kept + " of " + keep.size());
+    }
+
+    private boolean askedForNotifications;
+
+    /**
+     * Android 13+: the playback's notification needs POST_NOTIFICATIONS -
+     * asked for once, when music first plays (the media controls work
+     * without it, the notification is only not shown).
+     */
+    private void askForNotifications(String line) {
+        if (Build.VERSION.SDK_INT < 33 || askedForNotifications || line == null || !line.startsWith("3\t")) {
+            return;
+        }
+        askedForNotifications = true;
+        if (activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            activity.runOnUiThread(() -> activity.requestPermissions(
+                    new String[] {android.Manifest.permission.POST_NOTIFICATIONS}, 4203));
+        }
+    }
+
+    /**
+     * How the process ended last time (Android 11+): in the log, and - a
+     * crash or an ANR - on the screen, so that a report says what it was.
+     */
+    void reportLastExit() {
+        if (Build.VERSION.SDK_INT < 30) {
+            return;
+        }
+        try {
+            android.app.ActivityManager manager = activity.getSystemService(android.app.ActivityManager.class);
+            if (manager == null) {
+                return;
+            }
+            java.util.List<android.app.ApplicationExitInfo> exits =
+                    manager.getHistoricalProcessExitReasons(activity.getPackageName(), 0, 3);
+            for (android.app.ApplicationExitInfo exit : exits) {
+                Log.i(TAG, "an earlier exit: reason " + exit.getReason() + " (" + exit.getDescription()
+                        + "), status " + exit.getStatus() + ", importance " + exit.getImportance()
+                        + ", " + (System.currentTimeMillis() - exit.getTimestamp()) / 1000 + " s ago");
+            }
+            if (!exits.isEmpty()) {
+                android.app.ApplicationExitInfo last = exits.get(0);
+                String what = null;
+                switch (last.getReason()) {
+                    case android.app.ApplicationExitInfo.REASON_CRASH:
+                        what = "crashed (Java)";
+                        break;
+                    case android.app.ApplicationExitInfo.REASON_CRASH_NATIVE:
+                        what = "crashed (native)";
+                        break;
+                    case android.app.ApplicationExitInfo.REASON_ANR:
+                        what = "stopped answering (ANR)";
+                        break;
+                    default:
+                        break;
+                }
+                if (what != null) {
+                    event(EVENT_NOTE, 0, 0, 0, 0, "The app " + what + " last time"
+                            + (last.getDescription() == null ? "" : ": " + last.getDescription()));
+                }
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "the earlier exits could not be read: " + e);
+        }
     }
 
     /**

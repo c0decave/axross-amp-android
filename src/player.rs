@@ -114,6 +114,19 @@ pub struct Player {
     /// often it was.
     output_retry: Option<Instant>,
     output_tries: u32,
+    /// A new pick replaced the list while a track played: what played, so
+    /// that it plays on if nothing of the new pick can be opened - until a
+    /// track of the new pick is heard.
+    fallback: Option<Fallback>,
+}
+
+/// What played before a new pick (see [`Player::set_picked`]).
+struct Fallback {
+    picked: Vec<Picked>,
+    index: usize,
+    generation: u64,
+    info: TrackInfo,
+    duration: Option<f64>,
 }
 
 impl Player {
@@ -160,21 +173,66 @@ impl Player {
             seek_asked: None,
             output_retry: None,
             output_tries: 0,
+            fallback: None,
         }
     }
 
-    /// A new engine, after the old one ended while the app rested hidden
-    /// ([`crate::rest`]): the current track is opened again where it was,
-    /// paused.
-    pub fn new_engine(&mut self) {
+    /// The engine ends while the app rests (hidden and paused a while: its
+    /// output stream would keep the audio server busy for silence); the
+    /// next command starts a new one ([`Player::new_engine`]).
+    pub fn rest_engine(&mut self) {
+        self.transport.quit();
+    }
+
+    /// A new engine, after the old one ended while the app rested
+    /// ([`Player::rest_engine`]): the current track is opened again where
+    /// it was, playing if `play`.
+    pub fn new_engine(&mut self, play: bool) {
         let at = self.position();
         self.engine = new_engine(self.headless, &self.wake);
         self.transport.set_engine(self.engine.tx.clone());
         self.loaded = None;
         self.queued = None;
-        if let Some(index) = self.playlist.current.filter(|_| !self.stalled) {
-            self.play_index(index, (at.max(0.0) * 1000.0) as u64, false);
+        match self.playlist.current {
+            Some(index) => self.play_index(index, (at.max(0.0) * 1000.0) as u64, play),
+            None => self.transport.intend(false),
         }
+    }
+
+    /// The tracks picked last, the current one and where it was: the list
+    /// again, that track opened there, paused (the app's start).
+    pub fn restore(&mut self, tracks: Vec<Picked>, index: usize, position: f64) {
+        if tracks.is_empty() {
+            return;
+        }
+        let uri = tracks.get(index).map(|t| t.uri.clone());
+        self.set_picked(tracks, false);
+        // (the list is sorted again: the track by its URI)
+        let index = uri
+            .and_then(|uri| self.playlist.tracks.iter().position(|t| t.path == uri))
+            .unwrap_or(0);
+        self.play_index(index, (position.max(0.0) * 1000.0) as u64, false);
+    }
+
+    /// The pick the list was made from (what is saved).
+    pub fn picked(&self) -> &[Picked] {
+        &self.picked
+    }
+
+    /// The current track's place in [`Player::picked`] (which is in the
+    /// list's order).
+    pub fn current_index(&self) -> Option<usize> {
+        self.playlist.current
+    }
+
+    /// Whether a retry waits (the player wants to be pumped now and then).
+    pub fn retry_pending(&self) -> bool {
+        self.retry_at.is_some() || self.output_retry.is_some()
+    }
+
+    /// The seek waiting for the track to open, and the last one asked for.
+    pub fn seeks(&self) -> (Option<f64>, Option<(f64, Instant)>) {
+        (self.seek_pending.map(|(at, _)| at), self.seek_asked)
     }
 
     /// What the visualizations read: the samples played, the position.
@@ -236,10 +294,52 @@ impl Player {
 
     /// The picked tracks as the list to play (in a folder's order), the
     /// first of them playing if `play`.
+    ///
+    /// What plays now plays on until a track of the new pick is opened (the
+    /// engine changes tracks only then); if none of them can be, it plays
+    /// on for good, the old list with it, and the failure is said.
     pub fn set_picked(&mut self, tracks: Vec<Picked>, play: bool) {
+        self.fallback = match self.playlist.current {
+            Some(index) if self.ready() && self.transport.wants_playing() => Some(Fallback {
+                picked: std::mem::take(&mut self.picked),
+                index,
+                generation: self.generation,
+                info: self.info.clone(),
+                duration: self.duration,
+            }),
+            _ => None,
+        };
         self.picked = tracks;
         let tracks = self.picked_tracks();
         self.set_tracks(tracks, play);
+    }
+
+    /// Nothing of a new pick could be opened: the track that played before
+    /// it plays on (it never stopped), the list it was in is back. False:
+    /// there was none.
+    fn fall_back(&mut self, why: &str) -> bool {
+        let Some(old) = self.fallback.take() else {
+            return false;
+        };
+        self.picked = old.picked;
+        let tracks = self.picked_tracks();
+        self.playlist = Playlist::default();
+        self.playlist.add_tracks(tracks);
+        self.playlist.play(old.index);
+        self.generation = old.generation;
+        self.loaded = Some(old.generation);
+        self.info = old.info;
+        self.duration = old.duration;
+        self.queued = None;
+        self.stalled = false;
+        self.failures = 0;
+        self.copying.clear();
+        self.retry_at = None;
+        // (it plays on: the pick's intent to play is the old track's)
+        self.transport.intend(true);
+        self.status = format!("The new choice could not be played ({why}) - this plays on");
+        log::warn!(target: "axrossamp", "a new pick could not be played: the old track plays on");
+        true
     }
 
     /// More of the same pick (a folder is read in batches): into the list
@@ -563,7 +663,12 @@ impl Player {
                 Event::Failed {
                     generation,
                     message,
-                } if generation == self.generation => self.failed(message),
+                } if generation == self.generation => {
+                    // (the engine had loaded it: the old track is gone
+                    // already, there is no going back to it)
+                    self.fallback = None;
+                    self.failed(message)
+                }
                 Event::Output(said) => self.output(said),
                 _ => {}
             }
@@ -614,6 +719,8 @@ impl Player {
     }
 
     fn take_info(&mut self, info: TrackInfo) {
+        // (a track of the new pick is heard: no way back to the old one)
+        self.fallback = None;
         self.loaded = Some(self.generation);
         self.failures = 0;
         self.stalled = false;
@@ -673,6 +780,7 @@ impl Player {
                 self.play_index(i, 0, play);
                 self.status = format!("{name}: {why} - tried again later");
             }
+            None if self.fall_back(&why) => {}
             None => {
                 let now = Instant::now();
                 let due = self.next_retry().map_or(now, |(_, due)| due.max(now));
@@ -719,8 +827,10 @@ impl Player {
                 self.status = format!("{name}: {message}");
             }
             _ => {
-                self.stop();
-                self.stalled = true;
+                if !self.fall_back(&message) {
+                    self.stop();
+                    self.stalled = true;
+                }
             }
         }
     }

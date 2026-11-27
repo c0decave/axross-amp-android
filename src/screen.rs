@@ -20,7 +20,7 @@ use crate::amp::state::VisualOptions;
 use crate::amp::viz::{self, VizState};
 use crate::gesture::{self, Step, TapAction, Taps};
 use crate::platform::{self, Event};
-use crate::player::Player;
+use crate::service::{Handle, Places};
 use crate::watch;
 use eframe::egui;
 use egui::{
@@ -86,7 +86,8 @@ struct GpuCheck {
 static GPU_LOST: AtomicBool = AtomicBool::new(false);
 
 pub struct Screen {
-    player: Player,
+    /// The player on its own thread (it plays on while hidden).
+    player: Handle,
     /// (shared with what rests while the app is hidden: see [`crate::rest`])
     meters: Arc<Mutex<Option<Meters>>>,
     rest: Arc<crate::rest::Rest>,
@@ -146,15 +147,21 @@ impl Screen {
             move || ctx.request_repaint()
         };
         platform::set_waker(wake.clone());
-        let mut player = Player::start(config.cache, platform::open_fd, false, wake);
-        let meters = Arc::new(Mutex::new(Some(Meters::start(player.shared().clone()))));
-        // hidden for a while: the engine ends (its output stream closed),
-        // the meters stop - nothing keeps a hidden app's phone awake
+        let player = Handle::start(
+            Places {
+                cache: config.cache,
+                data: config.data.clone(),
+            },
+            platform::open_fd,
+            false,
+            wake,
+        );
+        let meters = Arc::new(Mutex::new(Some(Meters::start(player.shared()))));
+        // hidden for a while: the meters stop (they are for the picture) -
+        // the music plays on, on the player's thread
         let rest = {
-            let transport = player.transport.clone();
             let meters = meters.clone();
             crate::rest::Rest::new(crate::rest::REST_AFTER, move || {
-                transport.quit();
                 meters
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -163,10 +170,16 @@ impl Screen {
         };
         {
             let transport = player.transport.clone();
+            platform::set_interrupt_hook(move |what| transport.interrupt(what));
+        }
+        {
+            // (shown or hidden: told at once, on the Java side's thread -
+            // while hidden no frame comes to read an event)
             let rest = rest.clone();
-            platform::set_interrupt_hook(move |what| {
-                transport.interrupt(what);
-                if what == platform::Interrupt::Hidden {
+            let to_player = player.sender();
+            platform::set_lifecycle_hook(move |shown| {
+                let _ = to_player.send(crate::service::Cmd::Shown(shown));
+                if !shown {
                     watch::set_quiet(true);
                     rest.hidden();
                 }
@@ -212,7 +225,6 @@ impl Screen {
                 })
                 .collect();
             player.set_tracks(tracks, true);
-            platform::ask_audio_focus();
         }
         Screen {
             player,
@@ -281,50 +293,41 @@ impl Screen {
                         };
                     } else if first {
                         self.note.clear();
-                        // (it plays at once; the focus is asked for on the
-                        // side, and if another app keeps it, it pauses)
+                        // (it plays at once; the player asks for the focus
+                        // on the side, and if another app keeps it, pauses)
                         self.player.set_picked(tracks, true);
-                        platform::ask_audio_focus();
                         // (the controls stay a moment over the new music)
                         self.touched = ctx.input(|i| i.time);
                         self.controls = true;
                     } else if !tracks.is_empty() {
-                        let play = self.player.transport.wants_playing();
-                        self.player.add_picked(tracks, play);
+                        self.player.add_picked(tracks);
                     }
                     if !more {
-                        platform::log_line(&format!(
-                            "pick {pick}: {} tracks in the list",
-                            self.player.playlist.tracks.len()
-                        ));
+                        platform::log_line(&format!("pick {pick}: {} tracks so far", total));
                     }
                 }
                 Event::NoPicker => {
                     self.picking = false;
                     self.note = "This device has no app to pick documents with.".into();
                 }
-                // (the music was paused by the interrupt hook already)
+                // (the music plays on while hidden: the player's thread)
                 Event::Shown(shown) => {
                     self.shown_again = shown && self.frames > 0;
                     if shown {
                         watch::set_quiet(false);
-                        // (it rested: a new engine, the track where it was)
+                        // (it rested: the meters anew)
                         if self.rest.shown() {
-                            self.player.new_engine();
                             *self.meters.lock().unwrap_or_else(|p| p.into_inner()) =
-                                Some(Meters::start(self.player.shared().clone()));
-                            platform::log_line("shown again: a new engine and meters");
+                                Some(Meters::start(self.player.shared()));
+                            platform::log_line("shown again: the meters anew");
                         }
                     }
                 }
-                Event::Focus(granted) => {
-                    if !granted && self.player.transport.wants_playing() {
-                        self.player.pause();
-                        self.note = "Another app is using the sound.".into();
-                    }
-                }
                 Event::Interrupted(_) => {}
-                Event::Media(command) => self.media(command),
+                Event::Note(text) => {
+                    platform::log_line(&format!("note: {text}"));
+                    self.note = text;
+                }
             }
         }
         watch::doing("amp-window", "the player's news");
@@ -351,28 +354,12 @@ impl Screen {
         }
     }
 
-    /// A media command: the lock screen's, a headset's (step 2 sends them).
-    fn media(&mut self, command: i32) {
-        match command {
-            platform::MEDIA_PLAY if !self.player.transport.wants_playing() => self.toggle(),
-            platform::MEDIA_PAUSE | platform::MEDIA_STOP => self.player.pause(),
-            platform::MEDIA_TOGGLE => self.toggle(),
-            platform::MEDIA_NEXT => self.player.next(false),
-            platform::MEDIA_PREVIOUS => self.player.previous(),
-            platform::MEDIA_FORWARD => self.player.skip(BUTTON_SKIP),
-            platform::MEDIA_REWIND => self.player.skip(-BUTTON_SKIP),
-            _ => {}
-        }
-    }
-
     fn toggle(&mut self) {
         if self.player.transport.wants_playing() {
             self.player.pause();
-            platform::abandon_audio_focus();
         } else {
             self.note.clear();
             self.player.toggle();
-            platform::ask_audio_focus();
         }
     }
 
@@ -423,7 +410,7 @@ impl Screen {
     /// The track's cover: its texture (the cover face), its small picture
     /// (the flash guard's estimate of it).
     fn show_art(&mut self, ctx: &egui::Context) {
-        let art: Option<Arc<Art>> = self.player.info.art.clone();
+        let art: Option<Arc<Art>> = self.player.art();
         self.cover = art.as_deref().map(|art| {
             let size = [art.width as usize, art.height as usize];
             let image = egui::ColorImage::from_rgba_unmultiplied(size, &art.rgba);
@@ -444,8 +431,7 @@ impl Screen {
         let path = self
             .player
             .current_path()
-            .filter(|_| self.player.ready() && self.player.duration.is_some())
-            .map(str::to_owned);
+            .filter(|_| self.player.ready() && self.player.duration().is_some());
         let Some(path) = path else {
             if let Some((_, _, stop)) = self.overview.take() {
                 stop.store(true, Ordering::Relaxed);
@@ -489,7 +475,7 @@ impl Screen {
         // (the music stopped: the picture falls to rest in the clock's seconds)
         let fall_dt = since.clamp(0.0, 2.0);
         self.last_frame = Some(now);
-        let shared = self.player.shared().clone();
+        let shared = self.player.shared();
         let written = shared.tap_into(&mut self.tap);
         let rate = shared.device_rate.load(Ordering::Relaxed);
         let playing = self.player.playing();
@@ -536,7 +522,7 @@ impl Screen {
             title: &title,
             overview: overview.as_deref(),
             position: self.player.position() as f32,
-            duration: self.player.duration.unwrap_or(0.0) as f32,
+            duration: self.player.duration().unwrap_or(0.0) as f32,
             // (no pointer rests over a touch screen)
             hover: None,
             opacity: 1.0,
@@ -611,7 +597,8 @@ impl Screen {
         } else {
             (title, self.player.byline())
         };
-        let second = [&self.note, &self.player.status, &second]
+        let status = self.player.status();
+        let second = [&self.note, &status, &second]
             .into_iter()
             .find(|s| !s.is_empty())
             .cloned()
@@ -624,9 +611,9 @@ impl Screen {
 
         // the seek bar between the time gone and the track's length
         let row = Rect::from_min_size(pos2(inner.min.x, line.max.y), vec2(inner.width(), TOUCH));
-        let duration = self.player.duration.unwrap_or(0.0).max(0.0);
+        let duration = self.player.duration().unwrap_or(0.0).max(0.0);
         let position = self.player.shown_position().clamp(0.0, duration.max(0.0));
-        let can_seek = self.player.ready() && self.player.info.seekable && duration > 0.0;
+        let can_seek = self.player.ready() && self.player.seekable() && duration > 0.0;
         let shown = match (self.seeking, &self.winding) {
             (Some(at), _) => at as f64 * duration,
             (None, Some(wind)) => wind.to.clamp(0.0, duration.max(0.0)),
@@ -714,7 +701,7 @@ impl Screen {
         }
         let next = icon_button(ui, at(2.0), "next", Icon::Next, enabled);
         if self.hold(ui, &next, 1.0, now) {
-            self.player.next(false);
+            self.player.next();
         }
     }
 

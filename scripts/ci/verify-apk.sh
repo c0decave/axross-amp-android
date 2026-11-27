@@ -77,6 +77,22 @@ for abi in "${ABIS[@]}"; do
 done
 printf '%s\n' "$libs"
 
+# No network permission: the app makes no connection at all, and without
+# INTERNET Android does not let it open a socket (the merged manifest, as
+# the APK carries it).
+AAPT2=$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+if [ -n "$AAPT2" ]; then
+    permissions=$("$AAPT2" dump permissions "$APK" 2>&1)
+    printf '%s\n' "$permissions"
+    if printf '%s\n' "$permissions" | grep -E -q 'android\.permission\.(INTERNET|ACCESS_NETWORK_STATE|ACCESS_WIFI_STATE|CHANGE_NETWORK_STATE|CHANGE_WIFI_STATE)'; then
+        printf '%s\n' "$permissions" | annotate error "a network permission in $(basename "$APK")"
+        exit 1
+    fi
+    echo "no network permission"
+else
+    echo "::warning::no aapt2: the APK's permissions are not checked"
+fi
+
 # 16 KB pages (Android 15 on some devices): every native library's LOAD
 # segments aligned to 16 KB at least, and stored page-aligned in the APK -
 # else UnsatisfiedLinkError at the start on such a device.

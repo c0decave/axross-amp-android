@@ -125,6 +125,12 @@ pub fn set_names(on: bool) {
     NAMES.store(on, Ordering::Relaxed);
 }
 
+/// Whether this is a build that logs file names (the debug APK): its
+/// extra lines (the position while playing) are for the smoke test.
+pub fn names() -> bool {
+    NAMES.load(Ordering::Relaxed)
+}
+
 /// Quiet: the app is hidden - the watchdog looks only now and then, and
 /// wakes the device no more than that.
 static QUIET: AtomicBool = AtomicBool::new(false);
