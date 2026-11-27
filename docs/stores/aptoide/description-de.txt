@@ -1,0 +1,17 @@
+axross-amp spielt die Musik auf deinem Telefon und zeigt sie: 69 Visualisierungen ("Faces") - Spektren, Oszilloskope, Pegel, ein Wasserfall, eine Synthwave-Sonne, eine Galaxie, eine Stadt bei Nacht und vieles mehr - im Takt der Musik, auf dem ganzen Bildschirm.
+
+Warnung zur Lichtempfindlichkeit: Die Visualisierungen bewegen sich mit der Musik. Sie sind gegen Blitze, rote Blitze und Muster geschützt (WCAG 2.3.1 / 2.3.2), aber nicht für alle garantiert unbedenklich. Wenn du oder jemand, der zusieht, Epilepsie hat oder empfindlich auf flackerndes Licht reagiert, verwende sie nicht.
+
+Funktionen
+
+- Musik aus einem Ordner (mit Unterordnern) oder aus Dateien, ausgewählt mit Androids eigener Auswahl - ohne Speicherberechtigung.
+- Spielt im Hintergrund weiter, bei ausgeschaltetem Bildschirm und auf dem Sperrbildschirm; Medienbenachrichtigung und Steuerung auf dem Sperrbildschirm.
+- Wiedergabe / Pause, vorheriger / nächster Titel, 15 s zurück / vor, Suchleiste - in der App, in der Benachrichtigung, auf dem Sperrbildschirm und über Headsets.
+- Liste, Titel und Position sind beim nächsten Start wieder da.
+- MP3, FLAC, Ogg Vorbis, Opus, AAC / ALAC in MP4, WAV, AIFF, CAF, MKA; lückenlos.
+- Wischen für die nächste Visualisierung, Tippen für die Bedienelemente, oder eine aus der Liste wählen.
+
+Datenschutz
+Keine Netzwerkberechtigung und kein Netzwerkcode: kein Tracking, keine Werbung, keine Update-Prüfung, keine Absturzberichte, nichts wird heruntergeladen. Im Flugmodus funktioniert alles genauso. Was die App sich merkt (die zuletzt gewählte Liste und die Position) bleibt auf dem Telefon.
+
+Der Player ist axross-amps eigene Bibliothek (Rust: symphonia, cpal, egui, wgpu), derselbe Code wie auf dem Desktop. Android 9 oder neuer, arm64.
