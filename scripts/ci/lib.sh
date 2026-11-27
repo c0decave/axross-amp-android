@@ -64,3 +64,21 @@ step() {
         return "$rc"
     fi
 }
+
+# gradle ARGS... with retries: Maven Central answers 429 (too many
+# requests) now and then to a runner that resolves the Android Gradle
+# Plugin's tree - waited for (1, 2, 3 minutes) and tried again; any other
+# failure is one at once.
+gradle_retrying() {
+    local try log="$CI_LOGS/gradle-try.log"
+    for try in 1 2 3 4; do
+        if gradle --no-daemon --console=plain --stacktrace "$@" 2>&1 | tee "$log"; then
+            return 0
+        fi
+        if [ "$try" -eq 4 ] || ! grep -q -E "status code 429|Too Many Requests|Could not GET 'https://" "$log"; then
+            return 1
+        fi
+        echo "a Maven repository refused (429 or unreachable): once more in $((try * 60)) s"
+        sleep $((try * 60))
+    done
+}

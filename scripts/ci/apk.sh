@@ -17,7 +17,6 @@ cd "$ROOT"
 . scripts/ci/lib.sh
 
 APK=android/app/build/outputs/apk/debug/app-debug.apk
-GRADLE=(gradle --no-daemon --console=plain --stacktrace -p android)
 
 clippy() {
     cargo ndk --target arm64-v8a --platform 26 clippy --locked --lib -- -D warnings
@@ -49,7 +48,7 @@ offline_crates() {
 
 step "No network code in the Android build (cargo tree)" offline_crates
 step "The Rust side for Android (clippy, no warnings)" clippy
-step "Debug APK (arm64-v8a and x86_64)" "${GRADLE[@]}" assembleDebug
+step "Debug APK (arm64-v8a and x86_64)" gradle_retrying -p android assembleDebug
 step "What is in the APK" inspect
 # (the release's signature check, rehearsed on the debug APK)
 step "The APK's signature (scripts/ci/verify-apk.sh)" bash scripts/ci/verify-apk.sh "$APK" "" arm64-v8a x86_64
@@ -60,5 +59,5 @@ step "The APK's signature (scripts/ci/verify-apk.sh)" bash scripts/ci/verify-apk
 
 if [ ! -f android/gradle/verification-metadata.xml ]; then
     step "Gradle's dependency checksums (to review and commit)" \
-        "${GRADLE[@]}" -PskipCargo --write-verification-metadata sha256 assembleDebug
+        gradle_retrying -p android -PskipCargo --write-verification-metadata sha256 assembleDebug
 fi

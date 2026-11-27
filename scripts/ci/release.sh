@@ -23,7 +23,7 @@ build() {
         [ -n "${!name:-}" ] || { echo "::error::$name is not set: no signed release"; exit 1; }
     done
     step "Release APK (arm64-v8a), signed" \
-        gradle --no-daemon --console=plain --stacktrace -p android -Pabis=arm64-v8a assembleRelease
+        gradle_retrying -p android -Pabis=arm64-v8a assembleRelease
     if [ ! -f "$BUILT" ]; then
         ls -l android/app/build/outputs/apk/release 2>&1 \
             | annotate error "no signed APK (app-release.apk) was built"
