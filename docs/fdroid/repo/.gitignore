@@ -1,0 +1,10 @@
+# made by the workflow, never committed
+keystore.p12
+*.p12
+*.jks
+repo/
+archive/
+site/
+tmp/
+stats/
+build/

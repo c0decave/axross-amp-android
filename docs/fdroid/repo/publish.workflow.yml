@@ -55,7 +55,6 @@ jobs:
           umask 077
           printf '%s' "$FDROID_KEYSTORE_BASE64" | base64 --decode > keystore.p12
           chmod 600 config.yml
-          cp icon.png repo/icon.png
           fdroid update --use-date-from-apk --pretty
           python3 -I scripts/site.py keystore.p12 repo site
           rm -f keystore.p12

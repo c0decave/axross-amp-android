@@ -27,6 +27,11 @@ def main():
     password = os.environ["FDROID_KEYSTORE_PASS"].encode()
     _, cert, _ = pkcs12.load_key_and_certificates(open(keystore, "rb").read(), password)
     fingerprint = hashlib.sha256(cert.public_bytes(Encoding.DER)).hexdigest().upper()
+    # (the fingerprint the README and the users know: a key from the
+    # secrets that is not that one stops the run)
+    expected = open("fingerprint.txt").read().strip().replace(":", "").replace(" ", "").upper()
+    if fingerprint != expected:
+        sys.exit(f"the key's fingerprint {fingerprint} is not fingerprint.txt's {expected}")
     link = f"{URL}?fingerprint={fingerprint}"
     shutil.rmtree(site, ignore_errors=True)
     shutil.copytree(repo, os.path.join(site, "repo"))
